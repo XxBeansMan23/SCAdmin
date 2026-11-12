@@ -337,6 +337,28 @@ views.owner = async () => {
   if (S.me.role !== 'owner') throw new Error('Owner only');
   const o = await api('GET', '/api/owner/overview');
   const users = (await api('GET', '/api/users')).filter(u => u.role !== 'owner');
+  const dr = await api('GET', '/api/owner/drive').catch(() => null);
+  S.driveWaiting = !!(dr && dr.connect && dr.connect.state === 'waiting');
+  const credForm = `<form data-form="driveSave"><label>Client ID</label><input name="clientId" required autocomplete="off" placeholder="1234567890-abc.apps.googleusercontent.com">
+      <label>Client secret</label><input name="clientSecret" type="password" required autocomplete="off"><div style="margin-top:8px"><button class="btn pri">Save credentials</button></div></form>`;
+  const quota = dr && dr.quota ? `${bytesFmt(+dr.quota.usage || 0)} used${+dr.quota.limit ? ' of ' + bytesFmt(+dr.quota.limit) : ' (no limit reported)'}` : '';
+  const driveCard = !dr ? '' : `<div class="card"><h3>Google Drive storage ${dr.connected && dr.enabled ? '<span class="pill ok">ON</span>' : '<span class="pill">off</span>'}</h3><div class="bd">
+    ${!dr.configured ? `<p>Store uploaded clips and saves in <b>your Google Drive</b> instead of this server's disk. One-time setup:</p>
+      <ol style="margin:0 0 10px 18px;padding:0;line-height:1.7"><li>Open <b>console.cloud.google.com</b>, create a project, then <b>APIs &amp; Services → Library</b> and enable <b>Google Drive API</b>.</li>
+      <li><b>OAuth consent screen</b>: choose External, fill in an app name and your email, and set <b>Publishing status → In production</b> (the sign-in lapses after 7 days if you leave it in Testing).</li>
+      <li><b>Credentials → Create credentials → OAuth client ID</b>, application type <b>"TVs and Limited Input devices"</b>. Paste the client ID and secret below.</li></ol>${credForm}`
+    : !dr.connected ? `<p>Credentials saved (${esc(dr.clientIdHint)}). Next, connect your Google account.</p>
+      ${dr.connect && dr.connect.state === 'waiting' ? `<div style="padding:12px;border:2px dashed var(--accent);background:#fffaf0;margin:8px 0"><p style="margin:0 0 6px">1. Open <a href="${esc(dr.connect.verificationUrl)}" target="_blank" rel="noopener"><b>${esc(dr.connect.verificationUrl)}</b></a></p>
+        <p style="margin:0 0 6px">2. Enter this code: <b style="font-size:24px;letter-spacing:3px">${esc(dr.connect.userCode)}</b></p><p class="muted" style="margin:0">3. Pick your Google account and click Allow. This page updates by itself.</p></div>`
+        : `<div class="row"><button class="btn pri" data-act="driveConnect">Connect Google Drive</button></div>`}
+      ${dr.connect && dr.connect.error ? `<div class="err">${esc(dr.connect.error)}</div>` : ''}${dr.connect && dr.connect.state === 'expired' ? '<div class="err">That code expired. Click Connect again.</div>' : ''}
+      <details style="margin-top:10px"><summary class="muted" style="cursor:pointer">Change credentials</summary>${credForm}</details>`
+    : `<p>Connected${dr.account ? ' as <b>' + esc(dr.account) + '</b>' : ''}. New uploads go to the <b>${esc(dr.folder || 'SCAdmin Files')}</b> folder in your Drive. ${quota ? '<br><span class="muted">' + quota + '</span>' : ''}</p>
+      ${dr.error ? `<div class="err">${esc(dr.error)}</div>` : ''}
+      <div class="row"><button class="btn ${dr.enabled ? '' : 'pri'}" data-act="driveEnabled" data-on="${dr.enabled ? 0 : 1}">${dr.enabled ? 'Pause (new uploads go to this server)' : 'Turn Drive storage on'}</button>
+        <button class="btn bad" data-act="driveDisconnect">Disconnect</button></div>
+      <p class="muted" style="margin:10px 0 0">Files already uploaded stay where they are (server or Drive) and keep working. SCAdmin can only see files it created, never the rest of your Drive.</p>`}
+    </div></div>`;
   return `<h2 class="page-title">★ Owner tools <span class="pill acc">elevated</span></h2>
   <p class="muted">Only the owner account (${esc(S.me.nickname)}) sees this menu. Admins cannot open it.</p>
   <div class="stats"><div class="stat"><b>${o.members}</b>Members (${o.admins} admins)</div><div class="stat"><b>${o.messages}</b>Chat messages</div>
@@ -353,6 +375,7 @@ views.owner = async () => {
       <td><input type="checkbox" style="width:auto" data-change="ownerPerm" data-id="${u.id}" data-perm="deleteMessages" ${u.perms && u.perms.deleteMessages ? 'checked' : ''}></td>
       <td><input type="checkbox" style="width:auto" data-change="ownerPerm" data-id="${u.id}" data-perm="viewEmails" ${u.perms && u.perms.viewEmails ? 'checked' : ''}></td>
       <td>${statusPill(u)}</td><td class="row"><button class="btn sm" data-act="openUser" data-id="${u.id}">Open</button><button class="btn sm bad" data-act="ownerDelete" data-id="${u.id}" data-name="${esc(u.nickname)}">Delete</button></td></tr>`).join('') || '<tr><td colspan="5" class="muted">No other members yet</td></tr>'}</table></div>
+  ${driveCard}
   <div class="card"><h3>Sessions and backup</h3><div class="bd row">
     <button class="btn" data-act="ownerSignoutAll">Sign out everyone else</button>
     <a class="btn" href="/api/owner/backup">Download backup (JSON)</a>
@@ -361,6 +384,7 @@ views.owner = async () => {
 views.mine = () => { S.view = 'user'; S.uid = S.me.id; return views.user(); };
 const afterRender = {
   chat: chatAfter,
+  owner() { if (S.driveWaiting) setTimeout(() => { if (S.view === 'owner') render(); }, 4000); },   // poll while the Google sign-in is pending
   members() { const q = $('#mq'); q.addEventListener('input', () => { clearTimeout(searchT); searchT = setTimeout(async () => { S.mq = q.value; const pos = q.selectionStart; await render(); const n = $('#mq'); n.focus(); n.setSelectionRange(pos, pos); }, 300); }); },
   audit() { const q = $('#auditQ'); q.addEventListener('input', () => { clearTimeout(searchT); searchT = setTimeout(async () => { S.auditQ = q.value; const pos = q.selectionStart; await render(); const n = $('#auditQ'); n.focus(); n.setSelectionRange(pos, pos); }, 300); }); },
 };
@@ -497,6 +521,9 @@ const acts = {
     if (!confirm(`Permanently delete ${el.dataset.name}, their saves, DMs and logs? This cannot be undone.`)) return;
     await api('DELETE', '/api/users/' + el.dataset.id); toast('Account deleted'); render();
   },
+  async driveConnect() { await api('POST', '/api/owner/drive/connect', {}); render(); },
+  async driveDisconnect() { if (!confirm('Disconnect Google Drive? New uploads will go to this server. Files already in Drive keep working only while connected.')) return; await api('POST', '/api/owner/drive/disconnect', {}); toast('Disconnected'); render(); },
+  async driveEnabled(el) { await api('POST', '/api/owner/drive/enabled', { enabled: el.dataset.on === '1' }); toast(el.dataset.on === '1' ? 'Drive storage on' : 'Drive storage paused'); render(); },
   showSignup() { renderSetup(false); },
   showLogin() { renderLogin(); },
   async rotateInvite() { if (!confirm('Generate a new invite code? The old one stops working.')) return; const c = await api('POST', '/api/invite', {}); $('#invcode').textContent = c.code; toast('New invite code'); },
@@ -563,6 +590,7 @@ const changes = {
   auditCat(el) { S.auditCat = el.value; render(); },
 };
 const forms = {
+  async driveSave(f, d) { await api('POST', '/api/owner/drive/config', d); toast('Credentials saved'); render(); },
   async ownerAnnounce(f, d) { await api('POST', '/api/owner/settings', { announcement: d.announcement }); toast('Announcement published'); render(); },
   async sendMsg(f, d) {
     const file = f.file.files[0], text = (d.text || '').trim();

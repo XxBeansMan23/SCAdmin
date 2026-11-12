@@ -17,9 +17,21 @@ Zero dependencies: just Node 20+ (no `npm install`).
 | **Moderation** | Suspend / ban with reason and expiry, flag queue, report from crews |
 | **Crews** | Leader + ranks, add/remove, transfer leadership |
 | **Cloud Saves** | Upload and download save files per member |
+| **Storage** | No upload size limit (streamed to disk). Optional **Google Drive storage**: Owner tools -> Google Drive storage (see below) |
 | **Audit log** | Global searchable log of every change |
 
 Add games or stat fields in the `GAMES` array at the top of `server.js`.
+
+### Google Drive storage (local Node server)
+
+Uploads (chat files, clips, cloud saves) can go to **your Google Drive** instead of the server's disk. The owner sets it up in **Owner tools -> Google Drive storage**; credentials are typed into that page and saved to `data/drive.json` (git-ignored), never sent anywhere but Google.
+
+1. console.cloud.google.com -> new project -> **APIs & Services -> Library** -> enable **Google Drive API**.
+2. **OAuth consent screen**: External, add an app name and your email, and set **Publishing status -> In production** (in "Testing" Google expires the sign-in after 7 days; `drive.file` needs no verification).
+3. **Credentials -> Create credentials -> OAuth client ID**, type **"TVs and Limited Input devices"**. Paste the client ID and secret into Owner tools.
+4. Click **Connect Google Drive**, open google.com/device, enter the code, pick your account, Allow.
+
+SCAdmin only gets the `drive.file` scope, so it can see only files it created itself (in a folder called *SCAdmin Files*), never the rest of your Drive. Uploads stream through the server (no size limit, constant memory) and downloads support Range requests, so videos still seek. Files already stored stay where they are; **Pause** or **Disconnect** sends new uploads back to local disk. If Drive is unreachable when an upload starts, it falls back to local disk.
 
 ### Permissions (local Node server)
 

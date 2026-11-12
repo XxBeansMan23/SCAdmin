@@ -161,6 +161,51 @@ function readBody(req, limit) {
     req.on('error', reject);
   });
 }
+// ---------------------------------------------------------------- file storage: local disk or Google Drive (see drive.js)
+const drive = require('./drive').create(DATA);
+const MEDIA = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
+  mp4: 'video/mp4', m4v: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime', ogv: 'video/ogg' };
+/** Store an incoming upload. Goes to Google Drive when connected (falls back to local disk if Drive is unreachable before any bytes are read). */
+async function storeIncoming(req, dir, id, name) {
+  const len = parseInt(req.headers['content-length'], 10) || 0;
+  if (drive.active() && len > 0) {
+    try { return { size: len, store: 'drive', driveId: await drive.upload(req, name, len) }; }
+    catch (e) { if (!e.beforeBody) throw e; console.error('Drive unavailable, saving locally:', e.message); }
+  }
+  return { size: await saveStream(req, path.join(dir, id)) };
+}
+function removeStored(rec, dir) {
+  if (rec.store === 'drive') drive.remove(rec.driveId).catch(e => console.error('Drive delete failed:', e.message));
+  else fs.rmSync(path.join(dir, rec.id), { force: true });
+}
+/** Send a stored file (local or Drive) with HTTP Range support. */
+async function serveStored(req, res, rec, dir, { type, disposition, name }) {
+  const h = { 'Content-Type': type, 'Accept-Ranges': 'bytes', 'X-Content-Type-Options': 'nosniff',
+    'Cache-Control': 'private, max-age=86400, immutable',   // file ids never change, so the browser can keep clips instead of re-downloading
+    'Content-Disposition': `${disposition}; filename="${name.replace(/"/g, '')}"` };
+  if (rec.store === 'drive') {
+    let up;
+    try { up = await drive.open(rec.driveId, req.headers.range); } catch (e) { throw fail(502, 'This file is stored in Google Drive, which is not reachable right now: ' + e.message); }
+    if (up.statusCode >= 400 && up.statusCode !== 416) { up.resume(); throw fail(502, 'Could not read the file from Google Drive'); }
+    if (up.headers['content-length']) h['Content-Length'] = up.headers['content-length'];
+    if (up.headers['content-range']) h['Content-Range'] = up.headers['content-range'];
+    res.writeHead(up.statusCode, h);
+    res.on('close', () => up.destroy());
+    return up.pipe(res);
+  }
+  const size = rec.size;
+  let start = 0, end = size - 1, code = 200;
+  const rg = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
+  if (rg && (rg[1] || rg[2])) {
+    if (rg[1] === '') start = Math.max(0, size - +rg[2]);
+    else { start = +rg[1]; if (rg[2]) end = Math.min(end, +rg[2]); }
+    if (start > end || start >= size) { res.writeHead(416, { 'Content-Range': `bytes */${size}` }); return res.end(); }
+    code = 206;
+  }
+  res.writeHead(code, { ...h, 'Content-Length': end - start + 1, ...(code === 206 ? { 'Content-Range': `bytes ${start}-${end}/${size}` } : {}) });
+  return fs.createReadStream(path.join(dir, rec.id), { start, end }).pipe(res);
+}
+
 // Stream a request body to a file; resolves with the byte count. Removes the partial file if the upload fails or is cancelled.
 function saveStream(req, dest) {
   return new Promise((resolve, reject) => {
@@ -294,6 +339,18 @@ async function api(req, res, url) {
       if ('announcement' in b) { db.settings.announcement = str(b.announcement, 300); log(me.id, 'profile', 'Announcement ' + (db.settings.announcement ? 'set' : 'cleared'), db.settings.announcement, me.nickname); }
       persist();
       return send(res, 200, { ok: true });
+    }
+    if (p.startsWith('/api/owner/drive')) {
+      if (m === 'GET' && p === '/api/owner/drive') return send(res, 200, await drive.status());
+      if (m !== 'POST') throw fail(404, 'Unknown endpoint');
+      const b = await readJson(req);
+      try {
+        if (p === '/api/owner/drive/config') { drive.setCredentials(str(b.clientId, 300), str(b.clientSecret, 300)); log(me.id, 'security', 'Google Drive credentials saved', '', me.nickname); persist(); return send(res, 200, { ok: true }); }
+        if (p === '/api/owner/drive/connect') return send(res, 200, await drive.startConnect());
+        if (p === '/api/owner/drive/disconnect') { drive.disconnect(); log(me.id, 'security', 'Google Drive disconnected', 'new uploads go to local disk', me.nickname); persist(); return send(res, 200, { ok: true }); }
+        if (p === '/api/owner/drive/enabled') { drive.setEnabled(!!b.enabled); log(me.id, 'security', b.enabled ? 'Google Drive storage turned on' : 'Google Drive storage turned off', '', me.nickname); persist(); return send(res, 200, { ok: true }); }
+      } catch (e) { throw e.code ? e : fail(400, e.message); }
+      throw fail(404, 'Unknown endpoint');
     }
     if (m === 'POST' && p === '/api/owner/perms') {
       const b = await readJson(req);
@@ -447,8 +504,8 @@ async function api(req, res, url) {
       const name = hdrName(req, 'file.bin');
       let text = ''; try { text = decodeURIComponent(String(req.headers['x-text'] || '')).trim().slice(0, 4000); } catch { /* ignore bad caption */ }
       const fid = uid() + uid();
-      const size = await saveStream(req, path.join(FILES, fid));   // streamed to disk: no size limit, no memory spike
-      const file = { id: fid, name, size };
+      const st = await storeIncoming(req, FILES, fid, name);   // streamed (disk or Drive): no size limit, no memory spike
+      const file = { id: fid, name, ...st };
       return send(res, 200, postMsg(c, text, file));
     }
   }
@@ -466,7 +523,7 @@ async function api(req, res, url) {
     }
     if (m === 'DELETE') {
       if (!can(me, 'deleteMessages')) throw fail(403, 'You need permission from the owner to delete messages');
-      if (x.file) fs.rmSync(path.join(FILES, x.file.id), { force: true });
+      if (x.file) removeStored(x.file, FILES);
       db.messages = db.messages.filter(z => z !== x); persist();
       return send(res, 200, { ok: true });
     }
@@ -475,23 +532,8 @@ async function api(req, res, url) {
     const x = db.messages.find(z => z.file && z.file.id === r[1]);
     if (!x || !canSee(chanOf(x.channelId), me)) throw fail(404, 'No such file');
     // inline only for a whitelist of image/video types; everything else is a forced download
-    const MEDIA = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
-      mp4: 'video/mp4', m4v: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime', ogv: 'video/ogg' };
     const inline = url.searchParams.get('inline') === '1' && MEDIA[x.file.name.split('.').pop().toLowerCase()];
-    const size = x.file.size;
-    let start = 0, end = size - 1, code = 200;
-    const rg = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
-    if (rg && (rg[1] || rg[2])) {       // Range support so videos can seek / resume
-      if (rg[1] === '') start = Math.max(0, size - +rg[2]);
-      else { start = +rg[1]; if (rg[2]) end = Math.min(end, +rg[2]); }
-      if (start > end || start >= size) { res.writeHead(416, { 'Content-Range': `bytes */${size}` }); return res.end(); }
-      code = 206;
-    }
-    res.writeHead(code, { 'Content-Type': inline || 'application/octet-stream', 'Content-Length': end - start + 1, 'Accept-Ranges': 'bytes',
-      ...(code === 206 ? { 'Content-Range': `bytes ${start}-${end}/${size}` } : {}), 'X-Content-Type-Options': 'nosniff',
-      'Cache-Control': 'private, max-age=86400, immutable',   // file ids never change, so the browser can keep clips instead of re-downloading
-      'Content-Disposition': `${inline ? 'inline' : 'attachment'}; filename="${x.file.name.replace(/"/g, '')}"` });
-    return fs.createReadStream(path.join(FILES, x.file.id), { start, end }).pipe(res);
+    return serveStored(req, res, x.file, FILES, { type: inline || 'application/octet-stream', disposition: inline ? 'inline' : 'attachment', name: x.file.name });
   }
 
   // ---- game schema, global audit log, moderation queue
@@ -642,7 +684,7 @@ async function api(req, res, url) {
       if (me.role !== 'owner') throw fail(403, 'Owner only');
       if (self) throw fail(400, 'You cannot delete yourself');
       dropSessions(target.id);
-      for (const s of db.saves.filter(s => s.userId === target.id)) fs.rmSync(path.join(SAVES, s.id), { force: true });
+      for (const s of db.saves.filter(s => s.userId === target.id)) removeStored(s, SAVES);
       db.saves = db.saves.filter(s => s.userId !== target.id);
       db.logs = db.logs.filter(l => l.userId !== target.id);
       db.flags = db.flags.filter(x => x.userId !== target.id);
@@ -806,8 +848,8 @@ async function api(req, res, url) {
       const name = hdrName(req, 'save.bin');
       const game = str(req.headers['x-game'] || 'Unsorted', 60);
       const sid = uid() + uid();
-      const size = await saveStream(req, path.join(SAVES, sid));
-      const rec = { id: sid, userId: target.id, game, name, size, uploadedAt: now(), by: me.nickname };
+      const st = await storeIncoming(req, SAVES, sid, name);
+      const rec = { id: sid, userId: target.id, game, name, ...st, uploadedAt: now(), by: me.nickname };
       db.saves.push(rec);
       log(target.id, 'profile', 'Cloud save uploaded', `${game}: ${name}`, me.nickname);
       persist();
@@ -819,15 +861,9 @@ async function api(req, res, url) {
     const s = db.saves.find(x => x.id === r[1]);
     if (!s) throw fail(404, 'No such save');
     if (!isAdmin(me) && me.id !== s.userId) throw fail(403, 'Not allowed');
-    if (m === 'GET') {
-      res.writeHead(200, {
-        'Content-Type': 'application/octet-stream', 'Content-Length': s.size,
-        'Content-Disposition': `attachment; filename="${s.name.replace(/"/g, '')}"`, 'X-Content-Type-Options': 'nosniff',
-      });
-      return fs.createReadStream(path.join(SAVES, s.id)).pipe(res);
-    }
+    if (m === 'GET') return serveStored(req, res, s, SAVES, { type: 'application/octet-stream', disposition: 'attachment', name: s.name });
     if (m === 'DELETE') {
-      fs.rmSync(path.join(SAVES, s.id), { force: true });
+      removeStored(s, SAVES);
       db.saves = db.saves.filter(x => x.id !== s.id);
       log(s.userId, 'profile', 'Cloud save deleted', `${s.game}: ${s.name}`, me.nickname);
       persist();
@@ -851,7 +887,7 @@ const FILES = path.join(DATA, 'files');
 fs.mkdirSync(FILES, { recursive: true });
 db.channels ||= []; db.messages ||= [];
 function dropChannel(c) {
-  for (const x of db.messages.filter(z => z.channelId === c.id && z.file)) fs.rmSync(path.join(FILES, x.file.id), { force: true });
+  for (const x of db.messages.filter(z => z.channelId === c.id && z.file)) removeStored(x.file, FILES);
   db.messages = db.messages.filter(z => z.channelId !== c.id);
   db.channels = db.channels.filter(z => z !== c);
 }
@@ -892,7 +928,7 @@ function serveStatic(req, res, url) {
   res.end(body);
 }
 
-http.createServer(async (req, res) => {
+const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   try {
     if (url.pathname.startsWith('/api/')) await api(req, res, url);
@@ -901,6 +937,12 @@ http.createServer(async (req, res) => {
     if (!res.headersSent) send(res, e.code >= 400 && e.code < 600 ? e.code : 500, { error: e.code ? e.message : 'Server error' });
     if (!e.code) console.error(e);
   }
-}).listen(PORT, HOST, () => {
+});
+// Big uploads: Node's defaults would cut a request off after 5 minutes and drop idle keep-alive sockets after 5 s (shorter than most
+// proxies expect, which shows up as random 502s). Disable the whole-request cap and keep idle connections open longer.
+server.requestTimeout = 0;
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
+server.listen(PORT, HOST, () => {
   console.log(`SCAdmin running on http://localhost:${PORT}  (listening on ${HOST})`);
 });

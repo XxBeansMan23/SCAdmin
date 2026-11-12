@@ -10,7 +10,7 @@ Zero dependencies: just Node 20+ (no `npm install`).
 
 | Area | What it does |
 |---|---|
-| **Chat** | Channels (`#general`, `#dev`, `#testers`, `#bugs`, `#builds`), private channels, DMs, file/build/screenshot sharing (25 MB), unread badges, edit/delete |
+| **Chat** | Channels (`#general`, `#dev`, `#testers`, `#bugs`, `#builds`), private channels, DMs, file/build/screenshot sharing, unread badges, edit/delete |
 | **Members** | Profile, team tag (Dev / Tester / QA…), linked accounts, admin notes, roles, password reset, sign-out-everywhere |
 | **Support Logs** | Per-member audit trail (Profile / Email / Security / Nickname / Password / Stats / Moderation) |
 | **StatMaster** | Edit rank, cash, kills etc. per game. A reason is mandatory and every change is logged |

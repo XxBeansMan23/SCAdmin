@@ -34,7 +34,6 @@ async function api(method, url, body) {
   return j;
 }
 async function uploadFile(url, file, meta) {
-  if (file.size > 25 * 1024 * 1024) throw new Error('File is over 25 MB');
   if (window.SCA) return window.SCA.upload(url, file, meta);
   const headers = { 'X-Requested-With': 'crewadmin', 'X-File-Name': encodeURIComponent(file.name) };
   if (meta.game) headers['X-Game'] = meta.game;
@@ -120,7 +119,8 @@ async function updateNav() {
   $('#nav').innerHTML = NAV.filter(n => (!n[3] || isAdmin()) && (n[0] !== 'owner' || (S.me.role === 'owner' && !window.SCA))).map(n =>
     `<button class="${cur === n[0] ? 'on' : ''}" title="${n[2]}" data-act="nav" data-v="${n[0]}">${n[1]}${badge(n) ? `<span class="dot">${badge(n)}</span>` : ''}</button>`).join('');
 }
-setInterval(() => { if (S.me && $('#nav') && S.view !== 'chat') updateNav(); }, 20000);
+setInterval(() => { if (S.me && $('#nav') && S.view !== 'chat' && !document.hidden) updateNav(); }, 20000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden && S.me && $('#nav')) { if (S.view === 'chat') loadMsgs(false).catch(() => {}); else updateNav(); } });   // catch up the moment you come back
 function go(view, extra = {}) { Object.assign(S, { view }, extra); render(); }
 async function render() {
   shell();
@@ -129,7 +129,7 @@ async function render() {
   try {
     let banner = '';
     if (!window.SCA) { try { S.me = await api('GET', '/api/me'); } catch { /* ignore */ } }   // pick up newly granted permissions
-    if (!window.SCA) { try { const a = (await api('GET', '/api/announcement')).text; if (a) banner = `<div class="announce">📢 ${esc(a)}</div>`; } catch { /* ignore */ } }
+    if (!window.SCA && S.me && S.me.announcement) banner = `<div class="announce">📢 ${esc(S.me.announcement)}</div>`;   // arrives with /api/me, no extra request
     const html = await views[S.view]();
     c.innerHTML = banner + html;
     if (afterRender[S.view]) afterRender[S.view]();
@@ -319,14 +319,14 @@ views.chat = async () => {
   S.chSig = ''; S.chanSig = S.chans.map(c => c.id + c.unread + c.name).join();
   return `<div class="chat"><aside class="chl" id="chl">${chanListHtml()}</aside><section class="chm"><div class="chh" id="chh"></div><div class="msgs" id="msgs"></div>
     <form class="comp" data-form="sendMsg"><textarea name="text" id="ctext" rows="2" maxlength="4000" placeholder="Message… (Enter to send, Shift+Enter for a new line)"></textarea>
-    <div class="row"><label class="btn sm" style="margin:0;display:inline-block;text-transform:none;font-size:12px;color:inherit;cursor:pointer">📎 Attach file (25 MB max)<input type="file" name="file" id="cfile" hidden></label><span class="muted" id="cfname"></span><span class="grow"></span><button class="btn pri">Send</button></div></form></section></div>`;
+    <div class="row"><label class="btn sm" style="margin:0;display:inline-block;text-transform:none;font-size:12px;color:inherit;cursor:pointer">📎 Attach file<input type="file" name="file" id="cfile" hidden></label><span class="muted" id="cfname"></span><span class="grow"></span><button class="btn pri">Send</button></div></form></section></div>`;
 };
 const chatAfter = async () => {
   drawChatHead();
   await loadMsgs(true);
   $('#ctext').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('form[data-form=sendMsg]').requestSubmit(); } });
   $('#cfile').addEventListener('change', () => { $('#cfname').textContent = $('#cfile').files[0] ? $('#cfile').files[0].name : ''; });
-  chatTimer = setInterval(() => loadMsgs(false).catch(() => {}), 3000);
+  chatTimer = setInterval(() => { if (!document.hidden) loadMsgs(false).catch(() => {}); }, 3000);   // no polling while the tab is in the background
   updateNav();
 };
 
@@ -449,7 +449,7 @@ const tabBody = {
     return `<div class="card"><h3>Cloud Saves (${saves.length})</h3><table><tr><th>Game</th><th>File</th><th>Size</th><th>Uploaded</th><th></th></tr>
       ${saves.map(s => `<tr><td>${esc(s.game)}</td><td>${esc(s.name)}</td><td>${(s.size / 1024).toFixed(1)} KB</td><td>${fmt(s.uploadedAt)}</td>
       <td class="row"><a class="btn sm" href="${esc(s.url || '/api/saves/' + s.id)}">Download</a><button class="btn sm bad" data-act="rmSave" data-id="${s.id}">Delete</button></td></tr>`).join('') || '<tr><td colspan="5" class="muted">No saves uploaded</td></tr>'}</table></div>
-    <div class="card"><h3>Upload a save (max 25 MB)</h3><div class="bd"><form data-form="upload" class="row">
+    <div class="card"><h3>Upload a save</h3><div class="bd"><form data-form="upload" class="row">
       <select name="game" style="width:auto">${S.games.map(g => `<option>${esc(g.name)}</option>`).join('')}<option>Other</option></select>
       <input type="file" name="file" required class="grow"><button class="btn pri">Upload</button></form></div></div>`;
   },

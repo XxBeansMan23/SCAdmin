@@ -6,6 +6,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const zlib = require('zlib');
 
 const PORT = +process.env.PORT || 8080;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -13,7 +14,7 @@ const DATA = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.jo
 const SAVES = path.join(DATA, 'saves');
 const PUBLIC = path.join(__dirname, 'docs');
 const DB_FILE = path.join(DATA, 'db.json');
-const MAX_UPLOAD = 25 * 1024 * 1024;
+// Uploads have no size limit: they are streamed straight to disk (see saveStream). Only your disk space limits them.
 fs.mkdirSync(SAVES, { recursive: true });
 
 // ---------------------------------------------------------------- database
@@ -35,11 +36,32 @@ const GAMES = [
     f('honor', 'Honor', -1000, 1000, 0), f('kills', 'Kills', 0, INT, 0), f('deaths', 'Deaths', 0, INT, 0), f('bounties', 'Bounties collected', 0, 100000, 0)] },
 ];
 const CREW_RANKS = ['Leader', 'Commissioner', 'Lieutenant', 'Representative', 'Muscle'];
-function persist() {
+// Saving is debounced + async + atomic (write tmp, rename): a burst of changes costs one write, and the event loop is never blocked.
+var persistTimer = null, persistBusy = false, persistDirty = false;
+function writeDb(done) {
   const tmp = DB_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(db, null, 2));
-  fs.renameSync(tmp, DB_FILE);
+  fs.writeFile(tmp, JSON.stringify(db), err => {
+    if (err) { console.error('save failed:', err.message); return done(); }
+    fs.rename(tmp, DB_FILE, e => { if (e) console.error('save failed:', e.message); done(); });
+  });
 }
+function flushDb() {
+  persistTimer = null;
+  if (!persistDirty) return;
+  persistDirty = false; persistBusy = true;
+  writeDb(() => { persistBusy = false; if (persistDirty && !persistTimer) persistTimer = setTimeout(flushDb, 100); });
+}
+function persist() {
+  persistDirty = true;
+  if (!persistTimer && !persistBusy) persistTimer = setTimeout(flushDb, 100);
+}
+function flushDbSync() {
+  if (!persistDirty && !persistTimer) return;
+  clearTimeout(persistTimer); persistTimer = null; persistDirty = false;
+  try { fs.writeFileSync(DB_FILE + '.tmp', JSON.stringify(db)); fs.renameSync(DB_FILE + '.tmp', DB_FILE); } catch (e) { console.error('save failed:', e.message); }
+}
+process.on('exit', flushDbSync);
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { flushDbSync(); process.exit(0); });
 const uid = () => crypto.randomBytes(6).toString('hex');
 const now = () => new Date().toISOString();
 
@@ -112,6 +134,7 @@ function liftExpired(u) {
   return u.status === 'active';
 }
 function log(userId, category, action, detail, by) {
+  if (db.logs.length > 20000) db.logs.splice(0, 2000);   // keep the audit log (and the database file) from growing forever
   db.logs.push({ id: uid(), userId, category, action, detail: detail || '', by: by || 'system', at: now() });
 }
 const str = (v, max = 200) => String(v ?? '').trim().slice(0, max);
@@ -119,8 +142,11 @@ const validEmail = e => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
 const colorFor = n => 'hsl(' + (parseInt(crypto.createHash('md5').update(n).digest('hex').slice(0, 4), 16) % 360) + ',55%,45%)';
 
 function send(res, code, obj, headers = {}) {
-  const body = JSON.stringify(obj);
-  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...headers });
+  let body = Buffer.from(JSON.stringify(obj));
+  const h = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', Vary: 'Accept-Encoding', ...headers };
+  if (body.length > 1024 && /\bgzip\b/.test((res.req && res.req.headers['accept-encoding']) || '')) { body = zlib.gzipSync(body, { level: 4 }); h['Content-Encoding'] = 'gzip'; }
+  h['Content-Length'] = body.length;
+  res.writeHead(code, h);
   res.end(body);
 }
 function readBody(req, limit) {
@@ -133,6 +159,25 @@ function readBody(req, limit) {
     });
     req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
+  });
+}
+// Stream a request body to a file; resolves with the byte count. Removes the partial file if the upload fails or is cancelled.
+function saveStream(req, dest) {
+  return new Promise((resolve, reject) => {
+    const out = fs.createWriteStream(dest);
+    let n = 0, done = false;
+    const bail = e => { if (done) return; done = true; out.destroy(); fs.rm(dest, { force: true }, () => {}); reject(e); };
+    req.on('data', c => { n += c.length; });
+    req.on('error', bail);
+    req.on('aborted', () => bail(Object.assign(new Error('Upload cancelled'), { code: 400 })));
+    out.on('error', e => bail(Object.assign(new Error(e.code === 'ENOSPC' ? 'Server disk is full' : 'Could not save the file'), { code: 507 })));
+    out.on('finish', () => {
+      if (done) return;
+      done = true;
+      if (!n) { fs.rm(dest, { force: true }, () => {}); return reject(Object.assign(new Error('Empty file'), { code: 400 })); }
+      resolve(n);
+    });
+    req.pipe(out);
   });
 }
 async function readJson(req) {
@@ -287,7 +332,7 @@ async function api(req, res, url) {
     const t = parseCookies(req).sid; sessions.delete(t);
     return send(res, 200, { ok: true }, { 'Set-Cookie': 'sid=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0' });
   }
-  if (m === 'GET' && p === '/api/me') return send(res, 200, clean(me));
+  if (m === 'GET' && p === '/api/me') return send(res, 200, { ...clean(me), announcement: db.settings.announcement || '' });
 
   if (m === 'GET' && p === '/api/users') {
     const q = str(url.searchParams.get('q')).toLowerCase();
@@ -326,17 +371,22 @@ async function api(req, res, url) {
   }
   const chanOf = id => db.channels.find(c => c.id === id);
   const canSee = (c, u) => c && ((c.kind === 'channel' && !c.private) || c.members.includes(u.id));
+  let umap = null;   // id -> user, built once per request instead of a linear search per message
+  const userById = id => { if (!umap) umap = new Map(db.users.map(u => [u.id, u])); return umap.get(id); };
   const msgView = x => {
-    const au = db.users.find(u => u.id === x.userId);
+    const au = userById(x.userId);
     return { id: x.id, channelId: x.channelId, userId: x.userId, nickname: au ? au.nickname : '(deleted)', color: au && au.color, team: au && au.team, text: x.text, at: x.at, editedAt: x.editedAt, file: x.file };
   };
-  const chanView = c => {
+  const msgsByChannel = () => { const mp = new Map(); for (const x of db.messages) { const a = mp.get(x.channelId); if (a) a.push(x); else mp.set(x.channelId, [x]); } return mp; };
+  const chanView = (c, idx) => {
     const readAt = (me.reads && me.reads[c.id]) || me.memberSince;
-    const msgs = db.messages.filter(x => x.channelId === c.id);
+    const msgs = (idx || msgsByChannel()).get(c.id) || [];
     let name = c.name;
-    if (c.kind === 'dm') { const o = db.users.find(u => u.id === c.members.find(x => x !== me.id)); name = o ? o.nickname : '(deleted)'; }
+    if (c.kind === 'dm') { const o = userById(c.members.find(x => x !== me.id)); name = o ? o.nickname : '(deleted)'; }
+    let unread = 0;
+    for (const x of msgs) if (x.at > readAt && x.userId !== me.id) unread++;
     return { id: c.id, name, kind: c.kind, private: c.private, topic: c.topic, members: c.kind === 'dm' ? [] : c.members.length,
-      unread: msgs.filter(x => x.at > readAt && x.userId !== me.id).length, last: msgs.length ? msgs[msgs.length - 1].at : c.createdAt };
+      unread, last: msgs.length ? msgs[msgs.length - 1].at : c.createdAt };
   };
   const postMsg = (c, text, file) => {
     const msg = { id: uid() + uid(), channelId: c.id, userId: me.id, text, at: now(), editedAt: null, file: file || null };
@@ -346,7 +396,8 @@ async function api(req, res, url) {
     return msgView(msg);
   };
   if (m === 'GET' && p === '/api/chat/channels') {
-    return send(res, 200, db.channels.filter(c => canSee(c, me)).map(chanView).sort((a, b) => (a.last < b.last ? 1 : -1)));
+    const idx = msgsByChannel();
+    return send(res, 200, db.channels.filter(c => canSee(c, me)).map(c => chanView(c, idx)).sort((a, b) => (a.last < b.last ? 1 : -1)));
   }
   if (m === 'POST' && p === '/api/chat/channels') {
     if (!can(me, 'createChannels')) throw fail(403, 'You need permission from the owner to create channels');
@@ -379,9 +430,9 @@ async function api(req, res, url) {
     }
     if (m === 'GET' && sub === '/messages') {
       const since = url.searchParams.get('since');
-      let list = db.messages.filter(x => x.channelId === c.id);
-      list = since ? list.filter(x => x.at > since).slice(-200) : list.slice(-150);
-      const last = db.messages.filter(x => x.channelId === c.id).slice(-1)[0];
+      const all = db.messages.filter(x => x.channelId === c.id);
+      const list = since ? all.filter(x => x.at > since).slice(-200) : all.slice(-150);
+      const last = all[all.length - 1];
       me.reads = me.reads || {};
       if (last && (me.reads[c.id] || '') < last.at) { me.reads[c.id] = last.at; persist(); }
       return send(res, 200, list.map(msgView));
@@ -395,10 +446,9 @@ async function api(req, res, url) {
     if (m === 'POST' && sub === '/upload') {
       const name = hdrName(req, 'file.bin');
       let text = ''; try { text = decodeURIComponent(String(req.headers['x-text'] || '')).trim().slice(0, 4000); } catch { /* ignore bad caption */ }
-      const body = await readBody(req, MAX_UPLOAD);
-      if (!body.length) throw fail(400, 'Empty file');
-      const file = { id: uid() + uid(), name, size: body.length };
-      fs.writeFileSync(path.join(FILES, file.id), body);
+      const fid = uid() + uid();
+      const size = await saveStream(req, path.join(FILES, fid));   // streamed to disk: no size limit, no memory spike
+      const file = { id: fid, name, size };
       return send(res, 200, postMsg(c, text, file));
     }
   }
@@ -439,6 +489,7 @@ async function api(req, res, url) {
     }
     res.writeHead(code, { 'Content-Type': inline || 'application/octet-stream', 'Content-Length': end - start + 1, 'Accept-Ranges': 'bytes',
       ...(code === 206 ? { 'Content-Range': `bytes ${start}-${end}/${size}` } : {}), 'X-Content-Type-Options': 'nosniff',
+      'Cache-Control': 'private, max-age=86400, immutable',   // file ids never change, so the browser can keep clips instead of re-downloading
       'Content-Disposition': `${inline ? 'inline' : 'attachment'}; filename="${x.file.name.replace(/"/g, '')}"` });
     return fs.createReadStream(path.join(FILES, x.file.id), { start, end }).pipe(res);
   }
@@ -754,10 +805,9 @@ async function api(req, res, url) {
     if (m === 'POST' && sub === '/saves') {
       const name = hdrName(req, 'save.bin');
       const game = str(req.headers['x-game'] || 'Unsorted', 60);
-      const body = await readBody(req, MAX_UPLOAD);
-      if (!body.length) throw fail(400, 'Empty file');
-      const rec = { id: uid() + uid(), userId: target.id, game, name, size: body.length, uploadedAt: now(), by: me.nickname };
-      fs.writeFileSync(path.join(SAVES, rec.id), body);
+      const sid = uid() + uid();
+      const size = await saveStream(req, path.join(SAVES, sid));
+      const rec = { id: sid, userId: target.id, game, name, size, uploadedAt: now(), by: me.nickname };
       db.saves.push(rec);
       log(target.id, 'profile', 'Cloud save uploaded', `${game}: ${name}`, me.nickname);
       persist();
@@ -818,14 +868,28 @@ const SEC = {
   'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer',
   'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'",
 };
+// Static files are read once, pre-gzipped and kept in memory; clients revalidate with an ETag and get a tiny 304 when nothing changed.
+const staticCache = new Map();
 function serveStatic(req, res, url) {
-  let f = url.pathname === '/' ? '/index.html' : decodeURIComponent(url.pathname);
+  let f;
+  try { f = url.pathname === '/' ? '/index.html' : decodeURIComponent(url.pathname); } catch { res.writeHead(400, SEC); return res.end('Bad request'); }
   const full = path.normalize(path.join(PUBLIC, f));
-  if (!full.startsWith(PUBLIC + path.sep) || !fs.existsSync(full) || fs.statSync(full).isDirectory()) {
-    res.writeHead(404, SEC); return res.end('Not found');
+  let st = null;
+  try { st = fs.statSync(full); } catch { /* missing */ }
+  if (!full.startsWith(PUBLIC + path.sep) || !st || st.isDirectory()) { res.writeHead(404, SEC); return res.end('Not found'); }
+  let ent = staticCache.get(full);
+  if (!ent || ent.mtime !== st.mtimeMs) {
+    const raw = fs.readFileSync(full), type = MIME[path.extname(full)] || 'application/octet-stream';
+    ent = { mtime: st.mtimeMs, raw, type, gz: /^(text\/|image\/svg)/.test(type) ? zlib.gzipSync(raw, { level: 9 }) : null,
+      etag: '"' + crypto.createHash('sha1').update(raw).digest('hex').slice(0, 20) + '"' };
+    staticCache.set(full, ent);
   }
-  res.writeHead(200, { ...SEC, 'Content-Type': MIME[path.extname(full)] || 'application/octet-stream', 'Cache-Control': 'no-cache' });
-  fs.createReadStream(full).pipe(res);
+  const base = { ...SEC, ETag: ent.etag, 'Cache-Control': 'no-cache', Vary: 'Accept-Encoding' };
+  if (req.headers['if-none-match'] === ent.etag) { res.writeHead(304, base); return res.end(); }
+  const gz = ent.gz && /\bgzip\b/.test(req.headers['accept-encoding'] || '');
+  const body = gz ? ent.gz : ent.raw;
+  res.writeHead(200, { ...base, 'Content-Type': ent.type, 'Content-Length': body.length, ...(gz ? { 'Content-Encoding': 'gzip' } : {}) });
+  res.end(body);
 }
 
 http.createServer(async (req, res) => {

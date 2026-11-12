@@ -41,6 +41,7 @@
     const urlCache = new Map();
     const readMark = new Map();
     const isImg = n => /\.(png|jpe?g|gif|webp)$/i.test(n || '');
+    const isVid = n => /\.(mp4|m4v|webm|mov|ogv)$/i.test(n || '');
 
     async function sessionUser() {
       const { data } = await sb.auth.getSession();
@@ -84,7 +85,11 @@
     async function msgView(m, d) {
       const au = d.get(m.user_id);
       let file = null;
-      if (m.file && m.file.path) file = { id: m.file.path, name: m.file.name, size: m.file.size, url: await signed(m.file.path, isImg(m.file.name) ? undefined : m.file.name) };
+      if (m.file && m.file.path) {
+        const media = isImg(m.file.name) || isVid(m.file.name);
+        file = { id: m.file.path, name: m.file.name, size: m.file.size, url: await signed(m.file.path, media ? undefined : m.file.name),
+          dl: media ? await signed(m.file.path, m.file.name) : undefined };
+      }
       return { id: m.id, channelId: m.channel_id, userId: m.user_id, nickname: au ? au.nickname : '(deleted)', color: au && au.color, team: au && au.team,
         text: m.text, at: m.at, editedAt: m.edited_at, file };
     }

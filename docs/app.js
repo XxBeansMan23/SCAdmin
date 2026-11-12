@@ -49,6 +49,8 @@ function toast(msg, bad) {
   clearTimeout(toastT); toastT = setTimeout(() => t.className = '', 3200);
 }
 const isAdmin = () => S.me && (S.me.role === 'owner' || S.me.role === 'admin');
+// owner always can; others only with a grant from the owner (Supabase mode keeps the old admin rule)
+const canDo = p => !!S.me && (S.me.role === 'owner' || (window.SCA ? isAdmin() : !!(S.me.perms && S.me.perms[p])));
 const av = (u, cls = '') => `<span class="av ${cls}" style="background:${esc(u.color || '#888')}">${esc((u.nickname || '?')[0].toUpperCase())}</span>`;
 const statusPill = u => u.status === 'banned' ? '<span class="pill bad">BANNED</span>' : u.status === 'suspended' ? '<span class="pill warn">SUSPENDED</span>' : '<span class="pill ok">Active</span>';
 const rolePill = r => `<span class="pill ${r === 'owner' ? 'acc' : ''}">${esc(r)}</span>`;
@@ -68,7 +70,7 @@ async function boot() {
   if (!S.me) return renderLogin();
   S.games = await api('GET', '/api/games');
   ensureGameTabs();
-  if (!isAdmin()) { S.view = 'chat'; S.uid = S.me.id; } else if (!['dashboard', 'chat', 'members', 'user', 'crews', 'crew', 'statmaster', 'moderation', 'audit'].includes(S.view)) S.view = 'dashboard';
+  if (!isAdmin()) { S.view = 'chat'; S.uid = S.me.id; } else if (!['dashboard', 'chat', 'members', 'user', 'crews', 'crew', 'statmaster', 'moderation', 'audit', 'owner'].includes(S.view)) S.view = 'dashboard';
   if (isAdmin() && S.view === 'members' && !S.uid) S.view = 'dashboard';
   app.innerHTML = '';
   render();
@@ -98,7 +100,7 @@ function renderSetup(first) {
 // ------------------------------------------------------------------ shell
 const NAV = [
   ['dashboard', '⌂', 'Dashboard', true], ['chat', '✉', 'Chat', false], ['members', '☰', 'Members', true], ['crews', '⚑', 'Crews', false],
-  ['statmaster', '▤', 'StatMaster', true], ['moderation', '⚠', 'Moderation', true], ['audit', '≡', 'Audit log', true], ['mine', '☺', 'My profile', false],
+  ['statmaster', '▤', 'StatMaster', true], ['moderation', '⚠', 'Moderation', true], ['audit', '≡', 'Audit log', true], ['owner', '★', 'Owner tools', true], ['mine', '☺', 'My profile', false],
 ];
 function shell() {
   if ($('#content')) return;
@@ -115,7 +117,7 @@ async function updateNav() {
   try { S.unread = (await api('GET', '/api/chat/channels')).reduce((a, c) => a + c.unread, 0); } catch { /* ignore */ }
   const cur = S.view === 'user' && S.uid === S.me.id ? 'mine' : S.view === 'crew' ? 'crews' : S.view === 'user' ? 'members' : S.view;
   const badge = n => n[0] === 'moderation' && S.flagCount ? S.flagCount : n[0] === 'chat' && S.unread ? S.unread : 0;
-  $('#nav').innerHTML = NAV.filter(n => !n[3] || isAdmin()).map(n =>
+  $('#nav').innerHTML = NAV.filter(n => (!n[3] || isAdmin()) && (n[0] !== 'owner' || (S.me.role === 'owner' && !window.SCA))).map(n =>
     `<button class="${cur === n[0] ? 'on' : ''}" title="${n[2]}" data-act="nav" data-v="${n[0]}">${n[1]}${badge(n) ? `<span class="dot">${badge(n)}</span>` : ''}</button>`).join('');
 }
 setInterval(() => { if (S.me && $('#nav') && S.view !== 'chat') updateNav(); }, 20000);
@@ -125,8 +127,11 @@ async function render() {
   clearInterval(chatTimer);
   const c = $('#content');
   try {
+    let banner = '';
+    if (!window.SCA) { try { S.me = await api('GET', '/api/me'); } catch { /* ignore */ } }   // pick up newly granted permissions
+    if (!window.SCA) { try { const a = (await api('GET', '/api/announcement')).text; if (a) banner = `<div class="announce">📢 ${esc(a)}</div>`; } catch { /* ignore */ } }
     const html = await views[S.view]();
-    c.innerHTML = html;
+    c.innerHTML = banner + html;
     if (afterRender[S.view]) afterRender[S.view]();
   } catch (e) { c.innerHTML = `<div class="banner">${esc(e.message)}</div>`; }
   updateNav();
@@ -161,7 +166,7 @@ const views = {
     return `<h2 class="page-title">Members</h2>
     <div class="card"><h3>All members (${list.length})</h3><div class="bd"><input id="mq" placeholder="Filter by nickname, email, linked account or crew" value="${esc(S.mq)}"></div>
     <table><tr><th></th><th>Nickname</th><th>Email</th><th>Role</th><th>Status</th><th>Last login</th></tr>
-    ${list.map(u => `<tr class="click" data-act="openUser" data-id="${u.id}"><td>${av(u)}</td><td><b>${esc(u.nickname)}</b></td><td>${esc(u.email)}</td><td>${rolePill(u.role)}</td><td>${statusPill(u)}</td><td>${fmt(u.lastLogin)}</td></tr>`).join('')}</table></div>
+    ${list.map(u => `<tr class="click" data-act="openUser" data-id="${u.id}"><td>${av(u)}</td><td><b>${esc(u.nickname)}</b></td><td>${u.emailHidden ? '<span class="muted">hidden</span>' : esc(u.email)}</td><td>${rolePill(u.role)}</td><td>${statusPill(u)}</td><td>${fmt(u.lastLogin)}</td></tr>`).join('')}</table></div>
     <div class="card"><h3>Invite friends</h3><div class="bd"><p>Send people the site link and this invite code. They click <b>Sign up</b> on the sign-in page.</p>
       <div class="row"><code id="invcode" style="font-size:18px;padding:6px 10px;background:#f1f1f1;border:1px solid #ddd">${esc((await api('GET', '/api/invite')).code)}</code>
       <button class="btn" data-act="rotateInvite">Generate a new code</button></div>
@@ -265,24 +270,29 @@ const views = {
 function chanListHtml() {
   const item = c => `<div class="ci ${c.id === S.chan ? 'on' : ''}" data-act="pickChan" data-id="${c.id}">${c.kind === 'dm' ? '● ' : c.private ? '🔒 ' : '# '}${esc(c.name)}${c.unread ? `<span class="dot2">${c.unread}</span>` : ''}</div>`;
   const chs = S.chans.filter(c => c.kind === 'channel'), dms = S.chans.filter(c => c.kind === 'dm');
-  return `<h4>Channels ${isAdmin() ? '<a href="#" data-act="newChan" title="New channel">＋</a>' : ''}</h4>${chs.map(item).join('')}
+  return `<h4>Channels ${canDo('createChannels') ? '<a href="#" data-act="newChan" title="New channel">＋</a>' : ''}</h4>${chs.map(item).join('')}
     <h4>Direct messages</h4>${dms.map(item).join('') || '<div class="muted" style="padding:4px 12px">None yet</div>'}
     <div style="padding:10px"><select data-change="newDm"><option value="">＋ Start a DM…</option>${S.dir.filter(u => u.id !== S.me.id).map(u => `<option value="${u.id}">${esc(u.nickname)}${u.team ? ' (' + esc(u.team) + ')' : ''}</option>`).join('')}</select></div>`;
 }
 function fileHtml(f) {
   const url = f.url || '/api/chat/files/' + f.id;
   if (/\.(png|jpe?g|gif|webp)$/i.test(f.name)) return `<a href="${esc(url)}" target="_blank" rel="noopener"><img class="pic" src="${esc(f.url ? f.url : url + '?inline=1')}" alt="${esc(f.name)}"></a>`;
+  if (/\.(mp4|m4v|webm|mov|ogv)$/i.test(f.name)) {
+    const src = f.url ? f.url : url + '?inline=1';
+    return `<video class="vid" controls preload="metadata" playsinline src="${esc(src)}"></video>
+      <div class="muted t">🎬 ${esc(f.name)} · ${sizeFmt(f.size)} · <a href="${esc(f.dl || url)}">download</a></div>`;
+  }
   return `<a class="fcard" href="${esc(url)}">📎 <b>${esc(f.name)}</b> <span class="muted">${sizeFmt(f.size)} · download</span></a>`;
 }
 function msgHtml(m) {
   const mine = m.userId === S.me.id;
   return `<div class="msg">${av({ nickname: m.nickname, color: m.color })}<div class="mb"><div><b>${esc(m.nickname)}</b>${m.team ? ` <span class="pill acc">${esc(m.team)}</span>` : ''}
-    <span class="muted t">${fmt(m.at)}${m.editedAt ? ' · edited' : ''}</span>${mine ? ` <a href="#" class="muted t" data-act="editMsg" data-id="${m.id}">edit</a>` : ''}${mine || isAdmin() ? ` <a href="#" class="muted t" data-act="delMsg" data-id="${m.id}">delete</a>` : ''}</div>
+    <span class="muted t">${fmt(m.at)}${m.editedAt ? ' · edited' : ''}</span>${mine ? ` <a href="#" class="muted t" data-act="editMsg" data-id="${m.id}">edit</a>` : ''}${canDo('deleteMessages') ? ` <a href="#" class="muted t" data-act="delMsg" data-id="${m.id}">delete</a>` : ''}</div>
     ${m.text ? `<div class="tx">${linkify(m.text)}</div>` : ''}${m.file ? fileHtml(m.file) : ''}</div></div>`;
 }
 function drawChatHead() {
   const c = S.chans.find(x => x.id === S.chan); const h = $('#chh'); if (!h) return;
-  h.innerHTML = c ? `<b>${c.kind === 'dm' ? '● ' : c.private ? '🔒 ' : '# '}${esc(c.name)}</b> <span class="muted">${esc(c.topic)}</span>${isAdmin() && c.kind === 'channel' ? ' <button class="btn sm bad" style="float:right" data-act="delChan">Delete channel</button>' : ''}` : '';
+  h.innerHTML = c ? `<b>${c.kind === 'dm' ? '● ' : c.private ? '🔒 ' : '# '}${esc(c.name)}</b> <span class="muted">${esc(c.topic)}</span>${canDo('createChannels') && c.kind === 'channel' ? ' <button class="btn sm bad" style="float:right" data-act="delChan">Delete channel</button>' : ''}` : '';
 }
 async function loadMsgs(first) {
   if (!S.chan) return;
@@ -320,6 +330,34 @@ const chatAfter = async () => {
   updateNav();
 };
 
+// ------------------------------------------------------------------ owner tools (elevated)
+function dur(s) { const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return (d ? d + 'd ' : '') + (h ? h + 'h ' : '') + m + 'm'; }
+const bytesFmt = n => n > 1073741824 ? (n / 1073741824).toFixed(2) + ' GB' : n > 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB';
+views.owner = async () => {
+  if (S.me.role !== 'owner') throw new Error('Owner only');
+  const o = await api('GET', '/api/owner/overview');
+  const users = (await api('GET', '/api/users')).filter(u => u.role !== 'owner');
+  return `<h2 class="page-title">★ Owner tools <span class="pill acc">elevated</span></h2>
+  <p class="muted">Only the owner account (${esc(S.me.nickname)}) sees this menu. Admins cannot open it.</p>
+  <div class="stats"><div class="stat"><b>${o.members}</b>Members (${o.admins} admins)</div><div class="stat"><b>${o.messages}</b>Chat messages</div>
+    <div class="stat"><b>${bytesFmt(o.dataBytes)}</b>Data stored</div><div class="stat"><b>${o.sessions}</b>Active sessions</div><div class="stat"><b>${dur(o.uptimeSec)}</b>Server uptime</div></div>
+  <div class="card"><h3>Sign-ups</h3><div class="bd"><div class="row"><span>Sign-ups are <b>${o.signupsOpen ? 'OPEN' : 'CLOSED'}</b></span>
+    <button class="btn ${o.signupsOpen ? 'bad' : 'pri'}" data-act="ownerSignups" data-open="${o.signupsOpen ? 0 : 1}">${o.signupsOpen ? 'Close sign-ups' : 'Open sign-ups'}</button></div>
+    <p class="muted" style="margin:10px 0 0">Invite code: <code>${esc(o.inviteCode)}</code> (regenerate it on the Members page).</p></div></div>
+  <div class="card"><h3>Announcement banner (everyone sees it)</h3><div class="bd"><form data-form="ownerAnnounce"><input name="announcement" maxlength="300" value="${esc(o.announcement)}" placeholder="e.g. Server restarts at 9pm, new build in #builds">
+    <div class="row" style="margin-top:8px"><button class="btn pri">Publish</button><button type="button" class="btn" data-act="ownerClearAnnounce">Clear</button></div></form></div></div>
+  <div class="card"><h3>Roles and accounts</h3><table><tr><th></th><th>Member</th><th>Role</th><th title="Create and delete channels">Channels</th><th title="Delete any chat message">Delete msgs</th><th title="See other accounts' email addresses">See emails</th><th>Status</th><th></th></tr>
+    ${users.map(u => `<tr><td>${av(u)}</td><td><b>${esc(u.nickname)}</b></td>
+      <td><select data-change="ownerRole" data-id="${u.id}" style="width:auto"><option ${u.role === 'member' ? 'selected' : ''}>member</option><option ${u.role === 'admin' ? 'selected' : ''}>admin</option></select></td>
+      <td><input type="checkbox" style="width:auto" data-change="ownerPerm" data-id="${u.id}" data-perm="createChannels" ${u.perms && u.perms.createChannels ? 'checked' : ''}></td>
+      <td><input type="checkbox" style="width:auto" data-change="ownerPerm" data-id="${u.id}" data-perm="deleteMessages" ${u.perms && u.perms.deleteMessages ? 'checked' : ''}></td>
+      <td><input type="checkbox" style="width:auto" data-change="ownerPerm" data-id="${u.id}" data-perm="viewEmails" ${u.perms && u.perms.viewEmails ? 'checked' : ''}></td>
+      <td>${statusPill(u)}</td><td class="row"><button class="btn sm" data-act="openUser" data-id="${u.id}">Open</button><button class="btn sm bad" data-act="ownerDelete" data-id="${u.id}" data-name="${esc(u.nickname)}">Delete</button></td></tr>`).join('') || '<tr><td colspan="5" class="muted">No other members yet</td></tr>'}</table></div>
+  <div class="card"><h3>Sessions and backup</h3><div class="bd row">
+    <button class="btn" data-act="ownerSignoutAll">Sign out everyone else</button>
+    <a class="btn" href="/api/owner/backup">Download backup (JSON)</a>
+    <span class="muted">The backup has members, chat, logs and settings. It does not include password hashes or uploaded files.</span></div></div>`;
+};
 views.mine = () => { S.view = 'user'; S.uid = S.me.id; return views.user(); };
 const afterRender = {
   chat: chatAfter,
@@ -330,7 +368,8 @@ const afterRender = {
 // ------------------------------------------------------------------ user tab bodies
 function logsPanel(u, logs) {
   const cats = ['all', 'profile', 'email', 'security', 'nickname', 'password', 'stats', 'moderation'];
-  const emailExtra = S.logTab === 'email' ? `<div class="bd" style="border-bottom:1px solid #ddd">
+  const emailExtra = S.logTab === 'email' && u.emailHidden ? '<div class="bd muted" style="border-bottom:1px solid #ddd">Email addresses are hidden. Only the owner (or someone they gave permission) can see other accounts\' emails.</div>'
+    : S.logTab === 'email' ? `<div class="bd" style="border-bottom:1px solid #ddd">
     <div class="muted">Original Email Address</div><b>${esc((u.emailHistory || []).slice(-1)[0]?.email || u.email)}</b>
     <div class="muted" style="margin-top:6px">Current Email Address</div><b>${esc(u.email)}</b><div class="muted">Published ${fmt(u.emailChanged)}</div>
     ${(u.emailHistory || [])[0] ? `<div class="muted" style="margin-top:6px">Previous Email Address</div><b>${esc(u.emailHistory[0].email)}</b>` : ''}</div>` : '';
@@ -361,14 +400,14 @@ const tabBody = {
       ${f('Online Service', 'CrewAdmin')}${f('Language', esc(u.language))}
       ${f('Account ID', esc(u.id))}${f('Country/Region', esc(u.country))}
       ${f('Date of Birth', esc(u.dob))}${f('Account Creation Path', 'Invited by admin')}
-      ${f('Email', esc(u.email))}${f('Member Since', fmt(u.memberSince))}
+      ${f('Email', u.emailHidden ? '<span class="muted">hidden (owner permission needed)</span>' : esc(u.email))}${f('Member Since', fmt(u.memberSince))}
       ${f('Password', '••••••••••')}${f('Last Portal Login', fmt(u.lastLogin))}
       ${f('Email Last Updated', fmt(u.emailChanged))}${f('Crew Associations', u.crews.map(c => `<a href="#" data-act="openCrew" data-id="${c.id}"><span class="pill acc">${esc(c.tag || c.name)}</span> ${esc(c.name)}</a>`).join('<br>'))}
       ${f('Team', u.team ? `<span class="pill acc">${esc(u.team)}</span>` : '')}${f('Bio', esc(u.bio))}
       ${f('Password Updated', fmt(u.passwordChanged))}</dl>`;
     const edit = `<form data-form="saveProfile" class="grid2">
       <div><label>Nickname</label><input name="nickname" value="${esc(u.nickname)}" required minlength="3" maxlength="24"></div>
-      <div><label>Email</label><input name="email" type="email" value="${esc(u.email)}" ${window.SCA ? '' : 'required'}></div>
+      ${u.emailHidden ? '' : `<div><label>Email</label><input name="email" type="email" value="${esc(u.email)}" ${window.SCA ? '' : 'required'}></div>`}
       <div><label>Date of birth</label><input name="dob" type="date" value="${esc(u.dob)}"></div>
       <div><label>Country / Region</label><input name="country" value="${esc(u.country)}"></div>
       <div><label>Language</label><input name="language" value="${esc(u.language)}"></div>
@@ -402,7 +441,7 @@ const tabBody = {
       ${self ? '<div><label>Current password</label><input name="current" type="password" required autocomplete="current-password"></div>' : ''}
       <div><label>New password (8+)</label><input name="password" type="password" required minlength="8" autocomplete="new-password"></div>
       <div style="align-self:end"><button class="btn pri">${self ? 'Update password' : 'Reset password'}</button></div></form></div></div>
-    <div class="card"><h3>Email history</h3><table><tr><th>Email</th><th>Used until</th></tr>${(u.emailHistory || []).map(h => `<tr><td>${esc(h.email)}</td><td>${fmt(h.until)}</td></tr>`).join('') || '<tr><td colspan="2" class="muted">No previous emails</td></tr>'}</table></div>`;
+    <div class="card"><h3>Email history</h3>${u.emailHidden ? '<div class="bd muted">Hidden. Needs the owner\'s permission to see other accounts\' emails.</div>' : ''}<table><tr><th>Email</th><th>Used until</th></tr>${(u.emailHistory || []).map(h => `<tr><td>${esc(h.email)}</td><td>${fmt(h.until)}</td></tr>`).join('') || '<tr><td colspan="2" class="muted">No previous emails</td></tr>'}</table></div>`;
   },
 
   async saves(u) {
@@ -450,6 +489,13 @@ const acts = {
     if (v === 'mine') return go('user', { uid: S.me.id, tab: 'details', logTab: 'all' });
     if (v === 'members') S.mq = '';
     go(v);
+  },
+  async ownerSignups(el) { await api('POST', '/api/owner/settings', { signupsOpen: el.dataset.open === '1' }); toast(el.dataset.open === '1' ? 'Sign-ups opened' : 'Sign-ups closed'); render(); },
+  async ownerClearAnnounce() { await api('POST', '/api/owner/settings', { announcement: '' }); toast('Announcement cleared'); render(); },
+  async ownerSignoutAll() { if (!confirm('Sign every other member out? They will need to sign in again.')) return; const r = await api('POST', '/api/owner/signout-all', {}); toast(`Signed out ${r.sessions} session(s)`); render(); },
+  async ownerDelete(el) {
+    if (!confirm(`Permanently delete ${el.dataset.name}, their saves, DMs and logs? This cannot be undone.`)) return;
+    await api('DELETE', '/api/users/' + el.dataset.id); toast('Account deleted'); render();
   },
   showSignup() { renderSetup(false); },
   showLogin() { renderLogin(); },
@@ -507,6 +553,8 @@ const acts = {
   async reportMember(el) { const reason = prompt('Why are you reporting this member?'); if (!reason) return; await api('POST', '/api/flags', { userId: el.dataset.uid, reason }); toast('Report sent to the admins'); },
 };
 const changes = {
+  async ownerPerm(el) { await api('POST', '/api/owner/perms', { userId: el.dataset.id, perm: el.dataset.perm, value: el.checked }); toast(el.checked ? 'Permission granted' : 'Permission revoked'); },
+  async ownerRole(el) { await api('PATCH', '/api/users/' + el.dataset.id, { role: el.value }); toast('Role updated'); render(); },
   async newDm(el) { if (!el.value) return; const c = await api('POST', '/api/chat/dm', { userId: el.value }); S.chan = c.id; render(); },
   async role(el) { await api('PATCH', '/api/users/' + S.uid, { role: el.value }); toast('Role updated'); render(); },
   async crewRank(el) { await api('PATCH', `/api/crews/${el.dataset.cid}/members/${el.dataset.uid}`, { rank: el.value }); toast('Rank updated'); },
@@ -515,6 +563,7 @@ const changes = {
   auditCat(el) { S.auditCat = el.value; render(); },
 };
 const forms = {
+  async ownerAnnounce(f, d) { await api('POST', '/api/owner/settings', { announcement: d.announcement }); toast('Announcement published'); render(); },
   async sendMsg(f, d) {
     const file = f.file.files[0], text = (d.text || '').trim();
     if (!file && !text) return;

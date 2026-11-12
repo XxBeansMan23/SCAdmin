@@ -120,3 +120,7 @@ tr.click{cursor:pointer}tr.click:hover{background:#fff6e8}
 .comp{border-top:1px solid #ddd;padding:10px 14px;background:#fafafa}
 .comp textarea{min-height:48px;margin-bottom:8px}
 @media(max-width:700px){.chl{width:140px}}
+
+/* video + announcement */
+.vid{display:block;margin-top:6px;width:100%;max-width:440px;max-height:320px;background:#000;border-radius:3px;border:1px solid #333}
+.announce{background:#fff4d6;border:1px solid #ecd49a;border-left:4px solid var(--accent);padding:8px 14px;margin-bottom:12px;font-weight:bold}

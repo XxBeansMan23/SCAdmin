@@ -91,6 +91,13 @@ function tooManyFails(ip) {
 
 // ---------------------------------------------------------------- helpers
 const isAdmin = u => u && (u.role === 'owner' || u.role === 'admin');
+// Fine-grained permissions: the owner always has them; everyone else only if the owner granted them.
+const PERMS = ['createChannels', 'deleteMessages', 'viewEmails'];
+const can = (u, perm) => !!u && (u.role === 'owner' || !!(u.perms && u.perms[perm]));
+// Emails are private: you see your own; others' only if you are the owner or were granted "viewEmails".
+const canSeeEmail = (viewer, targetId) => viewer.id === targetId || can(viewer, 'viewEmails');
+const viewUser = (viewer, u) => { const c = clean(u); return canSeeEmail(viewer, u.id) ? c : { ...c, email: '', emailHidden: true, emailHistory: [] }; };
+const viewLog = (viewer, l) => (l.category === 'email' && !canSeeEmail(viewer, l.userId) ? { ...l, detail: '(hidden)' } : l);
 const crewsOf = id => db.crews.filter(c => c.members.some(m => m.userId === id))
   .map(c => ({ id: c.id, name: c.name, tag: c.tag, rank: c.members.find(m => m.userId === id).rank }));
 const clean = u => {
@@ -199,6 +206,7 @@ async function api(req, res, url) {
 
   if (m === 'POST' && p === '/api/signup') {
     if (!db.users.length) throw fail(403, 'Use the first-time setup');
+    if (db.settings.signupsOpen === false) throw fail(403, 'Sign-ups are closed right now');
     if (tooManyFails(ip)) throw fail(429, 'Too many attempts. Wait a minute.');
     const b = await readJson(req);
     const code = Buffer.from(str(b.code, 64)), want = Buffer.from(db.settings.inviteCode);
@@ -208,7 +216,7 @@ async function api(req, res, url) {
     if (!validEmail(email)) throw fail(400, 'Invalid email');
     if (pw.length < 8) throw fail(400, 'Password must be 8+ characters');
     if (db.users.some(u => u.nickname.toLowerCase() === nick.toLowerCase())) throw fail(409, 'Nickname taken');
-    if (db.users.some(u => u.email === email)) throw fail(409, 'Email already used');
+    if (db.users.some(u => u.email === email)) throw fail(409, 'That email cannot be used');
     const u = makeUser({ nickname: nick, email, role: 'member', passHash: hashPw(pw) });
     u.lastLogin = now(); u.lastIp = ip; u.loginCount = 1; u.loginHistory = [{ at: u.lastLogin, ip, ua: str(req.headers['user-agent'], 120) }];
     db.users.push(u);
@@ -219,6 +227,55 @@ async function api(req, res, url) {
 
   const me = authUser(req);
   if (!me) throw fail(401, 'Not signed in');
+
+  if (m === 'GET' && p === '/api/announcement') return send(res, 200, { text: db.settings.announcement || '' });
+
+  // ---- Owner tools (elevated): only the owner account
+  if (p.startsWith('/api/owner/')) {
+    if (me.role !== 'owner') throw fail(403, 'Owner only');
+    const dirSize = d => { let n = 0; try { for (const e of fs.readdirSync(d, { withFileTypes: true })) n += e.isDirectory() ? dirSize(path.join(d, e.name)) : fs.statSync(path.join(d, e.name)).size; } catch { /* ignore */ } return n; };
+    if (m === 'GET' && p === '/api/owner/overview') {
+      return send(res, 200, {
+        uptimeSec: Math.round(process.uptime()), node: process.version, members: db.users.length,
+        admins: db.users.filter(u => u.role === 'admin' || u.role === 'owner').length, restricted: db.users.filter(u => u.status !== 'active').length,
+        channels: db.channels.length, messages: db.messages.length, chatFiles: db.messages.filter(x => x.file).length, saves: db.saves.length,
+        dataBytes: dirSize(DATA), signupsOpen: db.settings.signupsOpen !== false, inviteCode: db.settings.inviteCode, announcement: db.settings.announcement || '',
+        sessions: sessions.size,
+      });
+    }
+    if (m === 'POST' && p === '/api/owner/settings') {
+      const b = await readJson(req);
+      if ('signupsOpen' in b) { db.settings.signupsOpen = !!b.signupsOpen; log(me.id, 'security', db.settings.signupsOpen ? 'Sign-ups opened' : 'Sign-ups closed', '', me.nickname); }
+      if ('announcement' in b) { db.settings.announcement = str(b.announcement, 300); log(me.id, 'profile', 'Announcement ' + (db.settings.announcement ? 'set' : 'cleared'), db.settings.announcement, me.nickname); }
+      persist();
+      return send(res, 200, { ok: true });
+    }
+    if (m === 'POST' && p === '/api/owner/perms') {
+      const b = await readJson(req);
+      const t = db.users.find(u => u.id === b.userId);
+      if (!t) throw fail(404, 'No such member');
+      if (!PERMS.includes(b.perm)) throw fail(400, 'Unknown permission');
+      t.perms = { createChannels: false, deleteMessages: false, viewEmails: false, ...(t.perms || {}) };
+      t.perms[b.perm] = !!b.value;
+      const label = { createChannels: 'create/delete channels', deleteMessages: 'delete messages', viewEmails: 'see other accounts\' emails' }[b.perm];
+      log(t.id, 'security', `Permission ${b.value ? 'granted' : 'revoked'}`, label, me.nickname);
+      persist();
+      return send(res, 200, { ok: true });
+    }
+    if (m === 'POST' && p === '/api/owner/signout-all') {
+      let n = 0;
+      for (const [t, s] of sessions) if (s.uid !== me.id) { sessions.delete(t); n++; }
+      log(me.id, 'security', 'Signed out all other sessions', `${n} sessions`, me.nickname); persist();
+      return send(res, 200, { ok: true, sessions: n });
+    }
+    if (m === 'GET' && p === '/api/owner/backup') {
+      const out = JSON.stringify({ exportedAt: now(), note: 'Password hashes and uploaded file contents are not included.',
+        users: db.users.map(clean), crews: db.crews, channels: db.channels, messages: db.messages, logs: db.logs, flags: db.flags, saves: db.saves, settings: db.settings }, null, 2);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': `attachment; filename="scadmin-backup-${now().slice(0, 10)}.json"`, 'Cache-Control': 'no-store' });
+      return res.end(out);
+    }
+    throw fail(404, 'Unknown endpoint');
+  }
 
   if (p === '/api/invite') {
     if (!isAdmin(me)) throw fail(403, 'Admins only');
@@ -235,8 +292,8 @@ async function api(req, res, url) {
   if (m === 'GET' && p === '/api/users') {
     const q = str(url.searchParams.get('q')).toLowerCase();
     let list = isAdmin(me) ? db.users : [me];
-    if (q) list = list.filter(u => [u.nickname, u.email, u.id, ...(u.linked || []).map(l => l.name), ...crewsOf(u.id).map(c => c.name)].join(' ').toLowerCase().includes(q));
-    return send(res, 200, list.map(u => ({ id: u.id, nickname: u.nickname, email: u.email, role: u.role, status: u.status, color: u.color, lastLogin: u.lastLogin, memberSince: u.memberSince })));
+    if (q) list = list.filter(u => [u.nickname, canSeeEmail(me, u.id) ? u.email : '', u.id, ...(u.linked || []).map(l => l.name), ...crewsOf(u.id).map(c => c.name)].join(' ').toLowerCase().includes(q));
+    return send(res, 200, list.map(u => ({ id: u.id, nickname: u.nickname, email: canSeeEmail(me, u.id) ? u.email : '', emailHidden: !canSeeEmail(me, u.id), role: u.role, status: u.status, color: u.color, lastLogin: u.lastLogin, memberSince: u.memberSince, perms: u.perms || {} })));
   }
   if (m === 'GET' && p === '/api/overview') {
     if (!isAdmin(me)) throw fail(403, 'Admins only');
@@ -244,7 +301,7 @@ async function api(req, res, url) {
     return send(res, 200, {
       members: db.users.length, restricted: db.users.filter(u => u.status !== 'active').length,
       hours, saves: db.saves.length, crews: db.crews.length, openFlags: db.flags.filter(x => x.status === 'open').length,
-      recent: db.logs.slice(-15).reverse().map(l => ({ ...l, nickname: (db.users.find(u => u.id === l.userId) || {}).nickname || '?' })),
+      recent: db.logs.slice(-15).reverse().map(l => ({ ...viewLog(me, l), nickname: (db.users.find(u => u.id === l.userId) || {}).nickname || '?' })),
     });
   }
   if (m === 'POST' && p === '/api/users') {
@@ -255,12 +312,12 @@ async function api(req, res, url) {
     if (!validEmail(email)) throw fail(400, 'Invalid email');
     if (pw.length < 8) throw fail(400, 'Temporary password must be 8+ characters');
     if (db.users.some(u => u.nickname.toLowerCase() === nick.toLowerCase())) throw fail(409, 'Nickname taken');
-    if (db.users.some(u => u.email === email)) throw fail(409, 'Email already used');
+    if (db.users.some(u => u.email === email)) throw fail(409, 'That email cannot be used');
     const u = makeUser({ nickname: nick, email, role: 'member', passHash: hashPw(pw) });
     db.users.push(u);
     log(u.id, 'profile', 'Account created', 'By ' + me.nickname, me.nickname);
     persist();
-    return send(res, 200, clean(u));
+    return send(res, 200, viewUser(me, u));
   }
 
   // ---- team chat: channels, DMs, file sharing
@@ -292,7 +349,7 @@ async function api(req, res, url) {
     return send(res, 200, db.channels.filter(c => canSee(c, me)).map(chanView).sort((a, b) => (a.last < b.last ? 1 : -1)));
   }
   if (m === 'POST' && p === '/api/chat/channels') {
-    if (!isAdmin(me)) throw fail(403, 'Admins only');
+    if (!can(me, 'createChannels')) throw fail(403, 'You need permission from the owner to create channels');
     const b = await readJson(req);
     const name = str(b.name, 24).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '');
     if (name.length < 2) throw fail(400, 'Channel name must be 2+ characters (letters, numbers, dashes)');
@@ -316,7 +373,7 @@ async function api(req, res, url) {
     if (!canSee(c, me)) throw fail(404, 'No such channel');
     const sub = r[2] || '';
     if (m === 'DELETE' && !sub) {
-      if (!isAdmin(me) || c.kind !== 'channel') throw fail(403, 'Admins only');
+      if (!can(me, 'createChannels') || c.kind !== 'channel') throw fail(403, 'You need permission from the owner to delete channels');
       dropChannel(c); persist();
       return send(res, 200, { ok: true });
     }
@@ -358,7 +415,7 @@ async function api(req, res, url) {
       return send(res, 200, msgView(x));
     }
     if (m === 'DELETE') {
-      if (x.userId !== me.id && !isAdmin(me)) throw fail(403, 'Not allowed');
+      if (!can(me, 'deleteMessages')) throw fail(403, 'You need permission from the owner to delete messages');
       if (x.file) fs.rmSync(path.join(FILES, x.file.id), { force: true });
       db.messages = db.messages.filter(z => z !== x); persist();
       return send(res, 200, { ok: true });
@@ -367,11 +424,23 @@ async function api(req, res, url) {
   if (m === 'GET' && (r = p.match(/^\/api\/chat\/files\/([a-f0-9]+)$/))) {
     const x = db.messages.find(z => z.file && z.file.id === r[1]);
     if (!x || !canSee(chanOf(x.channelId), me)) throw fail(404, 'No such file');
-    const img = /\.(png|jpe?g|gif|webp)$/i.test(x.file.name) && url.searchParams.get('inline') === '1';
-    const type = img ? { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' }[x.file.name.split('.').pop().toLowerCase()] : 'application/octet-stream';
-    res.writeHead(200, { 'Content-Type': type, 'Content-Length': x.file.size, 'X-Content-Type-Options': 'nosniff',
-      'Content-Disposition': `${img ? 'inline' : 'attachment'}; filename="${x.file.name.replace(/"/g, '')}"` });
-    return fs.createReadStream(path.join(FILES, x.file.id)).pipe(res);
+    // inline only for a whitelist of image/video types; everything else is a forced download
+    const MEDIA = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
+      mp4: 'video/mp4', m4v: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime', ogv: 'video/ogg' };
+    const inline = url.searchParams.get('inline') === '1' && MEDIA[x.file.name.split('.').pop().toLowerCase()];
+    const size = x.file.size;
+    let start = 0, end = size - 1, code = 200;
+    const rg = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
+    if (rg && (rg[1] || rg[2])) {       // Range support so videos can seek / resume
+      if (rg[1] === '') start = Math.max(0, size - +rg[2]);
+      else { start = +rg[1]; if (rg[2]) end = Math.min(end, +rg[2]); }
+      if (start > end || start >= size) { res.writeHead(416, { 'Content-Range': `bytes */${size}` }); return res.end(); }
+      code = 206;
+    }
+    res.writeHead(code, { 'Content-Type': inline || 'application/octet-stream', 'Content-Length': end - start + 1, 'Accept-Ranges': 'bytes',
+      ...(code === 206 ? { 'Content-Range': `bytes ${start}-${end}/${size}` } : {}), 'X-Content-Type-Options': 'nosniff',
+      'Content-Disposition': `${inline ? 'inline' : 'attachment'}; filename="${x.file.name.replace(/"/g, '')}"` });
+    return fs.createReadStream(path.join(FILES, x.file.id), { start, end }).pipe(res);
   }
 
   // ---- game schema, global audit log, moderation queue
@@ -379,7 +448,7 @@ async function api(req, res, url) {
   if (m === 'GET' && p === '/api/logs') {
     if (!isAdmin(me)) throw fail(403, 'Admins only');
     const cat = url.searchParams.get('category'), q = str(url.searchParams.get('q')).toLowerCase();
-    let l = db.logs.map(x => ({ ...x, nickname: (db.users.find(u => u.id === x.userId) || {}).nickname || '(deleted)' }));
+    let l = db.logs.map(x => ({ ...viewLog(me, x), nickname: (db.users.find(u => u.id === x.userId) || {}).nickname || '(deleted)' }));
     if (cat && cat !== 'all') l = l.filter(x => x.category === cat);
     if (q) l = l.filter(x => (x.nickname + x.action + x.detail + x.by).toLowerCase().includes(q));
     return send(res, 200, l.slice(-300).reverse());
@@ -516,7 +585,7 @@ async function api(req, res, url) {
     const sub = r[2] || '';
     const self = me.id === target.id;
 
-    if (m === 'GET' && sub === '') return send(res, 200, clean(target));
+    if (m === 'GET' && sub === '') return send(res, 200, viewUser(me, target));
 
     if (m === 'DELETE' && sub === '') {
       if (me.role !== 'owner') throw fail(403, 'Owner only');
@@ -548,10 +617,11 @@ async function api(req, res, url) {
         }
       }
       if ('email' in b) {
+        if (!canSeeEmail(me, target.id)) throw fail(403, 'You need permission from the owner to change or see other accounts\' emails');
         const v = str(b.email).toLowerCase();
         if (!validEmail(v)) throw fail(400, 'Invalid email');
         if (v !== target.email) {
-          if (db.users.some(u => u.id !== target.id && u.email === v)) throw fail(409, 'Email already used');
+          if (db.users.some(u => u.id !== target.id && u.email === v)) throw fail(409, 'That email cannot be used');
           log(target.id, 'email', 'Email changed', `${target.email} -> ${v}`, me.nickname);
           target.emailHistory = [{ email: target.email, until: now() }, ...(target.emailHistory || [])].slice(0, 20);
           target.email = v; target.emailChanged = now();
@@ -575,7 +645,7 @@ async function api(req, res, url) {
         target.role = b.role;
       }
       persist();
-      return send(res, 200, clean(target));
+      return send(res, 200, viewUser(me, target));
     }
 
     if (m === 'POST' && sub === '/password') {
@@ -607,7 +677,7 @@ async function api(req, res, url) {
       target.linked = b.linked.slice(0, 30).map(l => ({ platform: str(l.platform, 30), name: str(l.name, 40) })).filter(l => l.platform && l.name);
       log(target.id, 'profile', 'Linked accounts updated', target.linked.map(l => l.platform).join(', '), me.nickname);
       persist();
-      return send(res, 200, clean(target));
+      return send(res, 200, viewUser(me, target));
     }
     // ---- StatMaster
     const sm = sub.match(/^\/stats\/(\w+)(\/reset)?$/);
@@ -634,7 +704,7 @@ async function api(req, res, url) {
         }
       } else throw fail(404, 'Unknown endpoint');
       persist();
-      return send(res, 200, clean(target));
+      return send(res, 200, viewUser(me, target));
     }
 
     // ---- Moderation
@@ -658,7 +728,7 @@ async function api(req, res, url) {
         log(target.id, 'moderation', act === 'ban' ? 'Account banned' : 'Account suspended', `${reason} (${d ? d + ' days' : 'permanent'})`, me.nickname);
       } else throw fail(400, 'Unknown action');
       persist();
-      return send(res, 200, clean(target));
+      return send(res, 200, viewUser(me, target));
     }
 
     if (m === 'PUT' && sub === '/games') {
@@ -670,14 +740,14 @@ async function api(req, res, url) {
       })).filter(g => g.game);
       log(target.id, 'profile', 'Games updated', target.games.length + ' titles', me.nickname);
       persist();
-      return send(res, 200, clean(target));
+      return send(res, 200, viewUser(me, target));
     }
 
     if (m === 'GET' && sub === '/logs') {
       const cat = url.searchParams.get('category');
       let l = db.logs.filter(x => x.userId === target.id);
       if (cat && cat !== 'all') l = l.filter(x => x.category === cat);
-      return send(res, 200, l.slice(-200).reverse());
+      return send(res, 200, l.slice(-200).reverse().map(x => viewLog(me, x)));
     }
 
     if (m === 'GET' && sub === '/saves') return send(res, 200, db.saves.filter(s => s.userId === target.id).reverse());
@@ -722,7 +792,7 @@ function makeUser(o) {
     id: uid(), nickname: o.nickname, email: o.email, role: o.role, status: 'active', passHash: o.passHash,
     color: colorFor(o.nickname), memberSince: now(), emailChanged: now(), passwordChanged: now(),
     dob: '', country: '', language: 'English', bio: '', team: '', notes: '', lastLogin: null, lastIp: '', loginCount: 0, loginHistory: [],
-    emailHistory: [], linked: [], games: [], stats: {}, ban: null,
+    emailHistory: [], linked: [], games: [], stats: {}, ban: null, perms: { createChannels: false, deleteMessages: false, viewEmails: false },
   };
 }
 

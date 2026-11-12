@@ -21,6 +21,20 @@ Zero dependencies: just Node 20+ (no `npm install`).
 
 Add games or stat fields in the `GAMES` array at the top of `server.js`.
 
+### Permissions (local Node server)
+
+The **owner** (the first account) can do everything. Everyone else, admins included, starts with none of these and only gets them when the owner ticks them in **Owner tools**:
+
+| Permission | Lets the person |
+|---|---|
+| Channels | create and delete channels |
+| Delete msgs | delete any chat message (editing your own message is always allowed) |
+| See emails | see and change other accounts' email addresses (everyone always sees their own) |
+
+Hidden emails are redacted on the server everywhere (member lists, profiles, search, email history, audit logs), not just in the UI. **Owner tools** also has sign-ups on/off, an announcement banner, role changes, delete account, sign-out-everyone and a JSON backup. Chat plays videos (mp4/webm/mov) inline with seeking instead of downloading them.
+
+These permissions are not implemented in the Supabase/Pages variant.
+
 ## Run it
 
 ```bash

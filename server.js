@@ -11,7 +11,7 @@ const PORT = +process.env.PORT || 8080;
 const HOST = process.env.HOST || '0.0.0.0';
 const DATA = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
 const SAVES = path.join(DATA, 'saves');
-const PUBLIC = path.join(__dirname, 'public');
+const PUBLIC = path.join(__dirname, 'docs');
 const DB_FILE = path.join(DATA, 'db.json');
 const MAX_UPLOAD = 25 * 1024 * 1024;
 fs.mkdirSync(SAVES, { recursive: true });

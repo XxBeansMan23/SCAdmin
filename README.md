@@ -31,12 +31,24 @@ First run prints a one-time **setup code** in the console. Open the site, enter 
 
 Environment variables: `PORT` (8080), `HOST` (0.0.0.0), `DATA_DIR` (./data), `SETUP_CODE` (use a fixed first-run code on a host where you cannot read the console).
 
-## Hosting on GitHub
+## Hosting on GitHub Pages (+ Supabase)
 
-**GitHub Pages cannot run this.** Pages only serves static files, and SCAdmin needs a server for logins, chat and uploads. Options:
+The UI lives in `docs/` and is served by **GitHub Pages**. Pages only serves files, so accounts, chat, uploads and logs are stored in a free **Supabase** project (Auth + Postgres with row-level security + Storage). `docs/supa-api.js` maps the UI's calls onto Supabase.
 
-1. **GitHub Codespaces** (runs the real server on GitHub): *Code -> Codespaces -> Create*. `.devcontainer` starts the server and forwards port 8080. Read the setup code with `cat /tmp/scadmin.log`, open the **Ports** tab, and set port 8080 to **Public** so friends can reach it. Free tier is limited and a Codespace sleeps when idle, so it is for sessions, not 24/7.
-2. **Always-on:** connect this repo to a Node host (Render, Railway, Fly.io…): start command `node server.js`, add a persistent disk and set `DATA_DIR` to it, set `SETUP_CODE`.
+One-time setup:
+
+1. Create a free project at supabase.com.
+2. **Authentication -> Providers -> Email -> turn OFF "Confirm email"** (SCAdmin logs in by nickname, not a real inbox).
+3. **SQL Editor -> New query**, paste all of `supabase/schema.sql`, Run. The result grid at the end shows your **setup_code** and **invite_code**.
+4. Put the project URL and the **anon public** key (Project Settings -> API) into `docs/config.js`. The anon key is meant to be public: it can only do what the row-level-security rules allow. **Never** use the `service_role` key.
+5. Repo **Settings -> Pages -> Source: Deploy from a branch -> `main` / `/docs`**.
+6. Open the site, **Create account** with the setup code (you become the owner). Give friends the site link and the invite code (Members page -> Invite friends).
+
+Limits of this mode: no admin-created accounts (people sign up with the invite code), sign-ins don't record IP addresses, Supabase free tier = 1 GB storage / 50 MB per file (SCAdmin caps at 25 MB) and projects pause after a week of no activity.
+
+## Running the local Node server instead
+
+`node server.js` with an empty `docs/config.js` serves the same UI backed by `data/` on your own PC (see above). It can also run in GitHub Codespaces (`.devcontainer`) or on any always-on Node host (`DATA_DIR`, `SETUP_CODE`).
 
 ## Security notes
 

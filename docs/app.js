@@ -14,7 +14,14 @@ const num = n => (+n || 0).toLocaleString();
 const S = { me: null, games: [], view: 'members', uid: null, tab: 'details', logTab: 'all', edit: false, crewId: null, cur: null,
   mq: '', smUser: '', smGame: 'gtav', auditCat: 'all', auditQ: '', flagCount: 0 };
 
+// Two backends behind one UI: window.SCA (Supabase, GitHub Pages) or the local Node server (fetch).
 async function api(method, url, body) {
+  if (window.SCA) {
+    try { return await window.SCA.api(method, url, body); } catch (e) {
+      if (e.status === 401 && S.me && url !== '/api/login') { S.me = null; boot(); }
+      throw e;
+    }
+  }
   const r = await fetch(url, {
     method, headers: { 'X-Requested-With': 'crewadmin', ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}) },
     body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -24,6 +31,16 @@ async function api(method, url, body) {
     if (r.status === 401 && S.me && url !== '/api/login') { S.me = null; boot(); }
     throw new Error(j.error || 'HTTP ' + r.status);
   }
+  return j;
+}
+async function uploadFile(url, file, meta) {
+  if (file.size > 25 * 1024 * 1024) throw new Error('File is over 25 MB');
+  if (window.SCA) return window.SCA.upload(url, file, meta);
+  const headers = { 'X-Requested-With': 'crewadmin', 'X-File-Name': encodeURIComponent(file.name) };
+  if (meta.game) headers['X-Game'] = meta.game;
+  if (meta.text !== undefined) headers['X-Text'] = encodeURIComponent(meta.text);
+  const r = await fetch(url, { method: 'POST', body: file, headers });
+  const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || 'Upload failed');
   return j;
 }
 let toastT;
@@ -45,7 +62,7 @@ async function boot() {
   const app = $('#app');
   try {
     const st = await api('GET', '/api/status');
-    if (st.needsSetup) return renderSetup();
+    if (st.needsSetup) return renderSetup(true);
     S.me = await api('GET', '/api/me');
   } catch { S.me = null; }
   if (!S.me) return renderLogin();
@@ -58,20 +75,24 @@ async function boot() {
 }
 function renderLogin() {
   $('#app').innerHTML = `<div class="auth"><div class="hd">${logo}</div><div class="bd">
-    <form data-form="login"><label>Nickname or email</label><input name="login" autocomplete="username" required autofocus>
+    <form data-form="login"><label>${window.SCA ? 'Nickname' : 'Nickname or email'}</label><input name="login" autocomplete="username" required autofocus>
     <label>Password</label><input name="password" type="password" autocomplete="current-password" required>
     <div class="err" id="err"></div><button class="btn pri" style="width:100%;margin-top:6px">Sign in</button></form>
-    <p class="muted" style="margin-bottom:0">Private panel. Ask the owner for an account.</p>
+    ${window.SCA ? '<button class="btn" style="width:100%;margin-top:8px" data-act="showSignup">Create account (invite code)</button>' : ''}
+    <p class="muted" style="margin-bottom:0">Private panel. Ask the owner for ${window.SCA ? 'an invite code' : 'an account'}.</p>
     <p class="muted" style="font-size:11px;margin:10px 0 0">Independent hobby project. Not affiliated with Rockstar Games.</p></div></div>`;
 }
-function renderSetup() {
+function renderSetup(first) {
+  const pages = !!window.SCA;
   $('#app').innerHTML = `<div class="auth"><div class="hd">${logo}</div><div class="bd">
-    <h1 style="color:#222;margin-top:12px">First-time setup</h1><p class="muted">Create the owner account. The setup code is printed in the server console.</p>
-    <form data-form="setup"><label>Setup code</label><input name="code" required>
-    <label>Nickname</label><input name="nickname" required minlength="3" maxlength="24">
-    <label>Email</label><input name="email" type="email" required>
+    <h1 style="color:#222;margin-top:12px">${first ? 'First-time setup' : 'Create account'}</h1>
+    <p class="muted">${first ? 'Create the owner account. ' + (pages ? 'The setup code is in your Supabase table "settings".' : 'The setup code is printed in the server console.') : 'Enter the invite code an admin gave you.'}</p>
+    <form data-form="setup"><label>${first ? 'Setup code' : 'Invite code'}</label><input name="code" required autocomplete="off">
+    <label>Nickname</label><input name="nickname" required minlength="3" maxlength="24" ${pages ? 'pattern="[A-Za-z0-9_.\\-]+" autocomplete="username"' : ''}>
+    <label>Email${pages ? ' (optional, display only)' : ''}</label><input name="email" type="email" ${pages ? '' : 'required'}>
     <label>Password (8+ characters)</label><input name="password" type="password" required minlength="8" autocomplete="new-password">
-    <div class="err" id="err"></div><button class="btn pri" style="width:100%;margin-top:6px">Create owner account</button></form></div></div>`;
+    <div class="err" id="err"></div><button class="btn pri" style="width:100%;margin-top:6px">${first ? 'Create owner account' : 'Create account'}</button></form>
+    ${first ? '' : '<button class="btn" style="width:100%;margin-top:8px" data-act="showLogin">← Back to sign in</button>'}</div></div>`;
 }
 
 // ------------------------------------------------------------------ shell
@@ -141,11 +162,15 @@ const views = {
     <div class="card"><h3>All members (${list.length})</h3><div class="bd"><input id="mq" placeholder="Filter by nickname, email, linked account or crew" value="${esc(S.mq)}"></div>
     <table><tr><th></th><th>Nickname</th><th>Email</th><th>Role</th><th>Status</th><th>Last login</th></tr>
     ${list.map(u => `<tr class="click" data-act="openUser" data-id="${u.id}"><td>${av(u)}</td><td><b>${esc(u.nickname)}</b></td><td>${esc(u.email)}</td><td>${rolePill(u.role)}</td><td>${statusPill(u)}</td><td>${fmt(u.lastLogin)}</td></tr>`).join('')}</table></div>
-    <div class="card"><h3>Add member</h3><div class="bd"><form data-form="addMember" class="grid2">
+    ${window.SCA ? `<div class="card"><h3>Invite friends</h3><div class="bd"><p>Send people the site link and this invite code. They click <b>Create account</b> on the sign-in page.</p>
+      <div class="row"><code id="invcode" style="font-size:18px;padding:6px 10px;background:#f1f1f1;border:1px solid #ddd">${esc((await api('GET', '/api/invite')).code)}</code>
+      <button class="btn" data-act="rotateInvite">Generate a new code</button></div>
+      <p class="muted" style="margin-bottom:0">Generating a new code stops the old one working. People already signed up are not affected.</p></div></div>`
+    : `<div class="card"><h3>Add member</h3><div class="bd"><form data-form="addMember" class="grid2">
       <div><label>Nickname</label><input name="nickname" required minlength="3" maxlength="24"></div>
       <div><label>Email</label><input name="email" type="email" required></div>
       <div><label>Temporary password (8+)</label><input name="password" required minlength="8"></div>
-      <div style="align-self:end"><button class="btn pri">Create account</button></div></form></div></div>`;
+      <div style="align-self:end"><button class="btn pri">Create account</button></div></form></div></div>`}`;
   },
 
   async user() {
@@ -245,9 +270,9 @@ function chanListHtml() {
     <div style="padding:10px"><select data-change="newDm"><option value="">＋ Start a DM…</option>${S.dir.filter(u => u.id !== S.me.id).map(u => `<option value="${u.id}">${esc(u.nickname)}${u.team ? ' (' + esc(u.team) + ')' : ''}</option>`).join('')}</select></div>`;
 }
 function fileHtml(f) {
-  const url = '/api/chat/files/' + f.id;
-  if (/\.(png|jpe?g|gif|webp)$/i.test(f.name)) return `<a href="${url}" target="_blank"><img class="pic" src="${url}?inline=1" alt="${esc(f.name)}"></a>`;
-  return `<a class="fcard" href="${url}">📎 <b>${esc(f.name)}</b> <span class="muted">${sizeFmt(f.size)} · download</span></a>`;
+  const url = f.url || '/api/chat/files/' + f.id;
+  if (/\.(png|jpe?g|gif|webp)$/i.test(f.name)) return `<a href="${esc(url)}" target="_blank" rel="noopener"><img class="pic" src="${esc(f.url ? f.url : url + '?inline=1')}" alt="${esc(f.name)}"></a>`;
+  return `<a class="fcard" href="${esc(url)}">📎 <b>${esc(f.name)}</b> <span class="muted">${sizeFmt(f.size)} · download</span></a>`;
 }
 function msgHtml(m) {
   const mine = m.userId === S.me.id;
@@ -343,7 +368,7 @@ const tabBody = {
       ${f('Password Updated', fmt(u.passwordChanged))}</dl>`;
     const edit = `<form data-form="saveProfile" class="grid2">
       <div><label>Nickname</label><input name="nickname" value="${esc(u.nickname)}" required minlength="3" maxlength="24"></div>
-      <div><label>Email</label><input name="email" type="email" value="${esc(u.email)}" required></div>
+      <div><label>Email</label><input name="email" type="email" value="${esc(u.email)}" ${window.SCA ? '' : 'required'}></div>
       <div><label>Date of birth</label><input name="dob" type="date" value="${esc(u.dob)}"></div>
       <div><label>Country / Region</label><input name="country" value="${esc(u.country)}"></div>
       <div><label>Language</label><input name="language" value="${esc(u.language)}"></div>
@@ -384,7 +409,7 @@ const tabBody = {
     const saves = await api('GET', `/api/users/${u.id}/saves`);
     return `<div class="card"><h3>Cloud Saves (${saves.length})</h3><table><tr><th>Game</th><th>File</th><th>Size</th><th>Uploaded</th><th></th></tr>
       ${saves.map(s => `<tr><td>${esc(s.game)}</td><td>${esc(s.name)}</td><td>${(s.size / 1024).toFixed(1)} KB</td><td>${fmt(s.uploadedAt)}</td>
-      <td class="row"><a class="btn sm" href="/api/saves/${s.id}">Download</a><button class="btn sm bad" data-act="rmSave" data-id="${s.id}">Delete</button></td></tr>`).join('') || '<tr><td colspan="5" class="muted">No saves uploaded</td></tr>'}</table></div>
+      <td class="row"><a class="btn sm" href="${esc(s.url || '/api/saves/' + s.id)}">Download</a><button class="btn sm bad" data-act="rmSave" data-id="${s.id}">Delete</button></td></tr>`).join('') || '<tr><td colspan="5" class="muted">No saves uploaded</td></tr>'}</table></div>
     <div class="card"><h3>Upload a save (max 25 MB)</h3><div class="bd"><form data-form="upload" class="row">
       <select name="game" style="width:auto">${S.games.map(g => `<option>${esc(g.name)}</option>`).join('')}<option>Other</option></select>
       <input type="file" name="file" required class="grow"><button class="btn pri">Upload</button></form></div></div>`;
@@ -426,6 +451,9 @@ const acts = {
     if (v === 'members') S.mq = '';
     go(v);
   },
+  showSignup() { renderSetup(false); },
+  showLogin() { renderLogin(); },
+  async rotateInvite() { if (!confirm('Generate a new invite code? The old one stops working.')) return; const c = await api('POST', '/api/invite', {}); $('#invcode').textContent = c.code; toast('New invite code'); },
   pickChan(el) { S.chan = el.dataset.id; render(); },
   async newChan() {
     const name = prompt('New channel name (letters, numbers, dashes):'); if (!name) return;
@@ -490,11 +518,8 @@ const forms = {
   async sendMsg(f, d) {
     const file = f.file.files[0], text = (d.text || '').trim();
     if (!file && !text) return;
-    if (file) {
-      if (file.size > 25 * 1024 * 1024) throw new Error('File is over 25 MB');
-      const r = await fetch(`/api/chat/channels/${S.chan}/upload`, { method: 'POST', body: file, headers: { 'X-Requested-With': 'crewadmin', 'X-File-Name': encodeURIComponent(file.name), 'X-Text': encodeURIComponent(text) } });
-      const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || 'Upload failed');
-    } else await api('POST', `/api/chat/channels/${S.chan}/messages`, { text });
+    if (file) await uploadFile(`/api/chat/channels/${S.chan}/upload`, file, { text });
+    else await api('POST', `/api/chat/channels/${S.chan}/messages`, { text });
     f.reset(); $('#cfname').textContent = '';
     S.chSig = ''; await loadMsgs(true);
   },
@@ -503,7 +528,7 @@ const forms = {
     boot();
   },
   async setup(f, d) {
-    try { await api('POST', '/api/setup', d); toast('Owner created — sign in'); } catch (e) { $('#err').textContent = e.message; return; }
+    try { await api('POST', '/api/setup', d); toast(window.SCA ? 'Account created' : 'Owner created — sign in'); } catch (e) { $('#err').textContent = e.message; return; }
     boot();
   },
   async saveProfile(f, d) { await api('PATCH', '/api/users/' + S.uid, d); S.edit = false; toast('Profile saved'); if (S.uid === S.me.id) S.me = await api('GET', '/api/me'); render(); },
@@ -513,9 +538,7 @@ const forms = {
   async addMember(f, d) { const u = await api('POST', '/api/users', d); toast('Member created'); go('user', { uid: u.id, tab: 'details' }); },
   async upload(f) {
     const file = f.file.files[0]; if (!file) return;
-    if (file.size > 25 * 1024 * 1024) throw new Error('File is over 25 MB');
-    const r = await fetch(`/api/users/${S.uid}/saves`, { method: 'POST', body: file, headers: { 'X-Requested-With': 'crewadmin', 'X-File-Name': encodeURIComponent(file.name), 'X-Game': f.game.value } });
-    const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || 'Upload failed');
+    await uploadFile(`/api/users/${S.uid}/saves`, file, { game: f.game.value });
     toast('Uploaded'); render();
   },
   async saveStats(f, d) {

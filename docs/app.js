@@ -78,8 +78,8 @@ function renderLogin() {
     <form data-form="login"><label>${window.SCA ? 'Nickname' : 'Nickname or email'}</label><input name="login" autocomplete="username" required autofocus>
     <label>Password</label><input name="password" type="password" autocomplete="current-password" required>
     <div class="err" id="err"></div><button class="btn pri" style="width:100%;margin-top:6px">Sign in</button></form>
-    ${window.SCA ? '<button class="btn" style="width:100%;margin-top:8px" data-act="showSignup">Create account (invite code)</button>' : ''}
-    <p class="muted" style="margin-bottom:0">Private panel. Ask the owner for ${window.SCA ? 'an invite code' : 'an account'}.</p>
+    <button class="btn" style="width:100%;margin-top:8px" data-act="showSignup">Sign up (invite code)</button>
+    <p class="muted" style="margin-bottom:0">Private panel. Ask the owner for an invite code.</p>
     <p class="muted" style="font-size:11px;margin:10px 0 0">Independent hobby project. Not affiliated with Rockstar Games.</p></div></div>`;
 }
 function renderSetup(first) {
@@ -87,7 +87,7 @@ function renderSetup(first) {
   $('#app').innerHTML = `<div class="auth"><div class="hd">${logo}</div><div class="bd">
     <h1 style="color:#222;margin-top:12px">${first ? 'First-time setup' : 'Create account'}</h1>
     <p class="muted">${first ? 'Create the owner account. ' + (pages ? 'The setup code is in your Supabase table "settings".' : 'The setup code is printed in the server console.') : 'Enter the invite code an admin gave you.'}</p>
-    <form data-form="setup"><label>${first ? 'Setup code' : 'Invite code'}</label><input name="code" required autocomplete="off">
+    <form data-form="setup" data-first="${first ? 1 : 0}"><label>${first ? 'Setup code' : 'Invite code'}</label><input name="code" required autocomplete="off">
     <label>Nickname</label><input name="nickname" required minlength="3" maxlength="24" ${pages ? 'pattern="[A-Za-z0-9_.\\-]+" autocomplete="username"' : ''}>
     <label>Email${pages ? ' (optional, display only)' : ''}</label><input name="email" type="email" ${pages ? '' : 'required'}>
     <label>Password (8+ characters)</label><input name="password" type="password" required minlength="8" autocomplete="new-password">
@@ -162,11 +162,11 @@ const views = {
     <div class="card"><h3>All members (${list.length})</h3><div class="bd"><input id="mq" placeholder="Filter by nickname, email, linked account or crew" value="${esc(S.mq)}"></div>
     <table><tr><th></th><th>Nickname</th><th>Email</th><th>Role</th><th>Status</th><th>Last login</th></tr>
     ${list.map(u => `<tr class="click" data-act="openUser" data-id="${u.id}"><td>${av(u)}</td><td><b>${esc(u.nickname)}</b></td><td>${esc(u.email)}</td><td>${rolePill(u.role)}</td><td>${statusPill(u)}</td><td>${fmt(u.lastLogin)}</td></tr>`).join('')}</table></div>
-    ${window.SCA ? `<div class="card"><h3>Invite friends</h3><div class="bd"><p>Send people the site link and this invite code. They click <b>Create account</b> on the sign-in page.</p>
+    <div class="card"><h3>Invite friends</h3><div class="bd"><p>Send people the site link and this invite code. They click <b>Sign up</b> on the sign-in page.</p>
       <div class="row"><code id="invcode" style="font-size:18px;padding:6px 10px;background:#f1f1f1;border:1px solid #ddd">${esc((await api('GET', '/api/invite')).code)}</code>
       <button class="btn" data-act="rotateInvite">Generate a new code</button></div>
-      <p class="muted" style="margin-bottom:0">Generating a new code stops the old one working. People already signed up are not affected.</p></div></div>`
-    : `<div class="card"><h3>Add member</h3><div class="bd"><form data-form="addMember" class="grid2">
+      <p class="muted" style="margin-bottom:0">Generating a new code stops the old one working. People already signed up are not affected.</p></div></div>
+    ${window.SCA ? '' : `<div class="card"><h3>Add member</h3><div class="bd"><form data-form="addMember" class="grid2">
       <div><label>Nickname</label><input name="nickname" required minlength="3" maxlength="24"></div>
       <div><label>Email</label><input name="email" type="email" required></div>
       <div><label>Temporary password (8+)</label><input name="password" required minlength="8"></div>
@@ -528,7 +528,8 @@ const forms = {
     boot();
   },
   async setup(f, d) {
-    try { await api('POST', '/api/setup', d); toast(window.SCA ? 'Account created' : 'Owner created — sign in'); } catch (e) { $('#err').textContent = e.message; return; }
+    const first = f.dataset.first === '1';
+    try { await api('POST', window.SCA || first ? '/api/setup' : '/api/signup', d); toast(first && !window.SCA ? 'Owner created — sign in' : 'Account created'); } catch (e) { $('#err').textContent = e.message; return; }
     boot();
   },
   async saveProfile(f, d) { await api('PATCH', '/api/users/' + S.uid, d); S.edit = false; toast('Profile saved'); if (S.uid === S.me.id) S.me = await api('GET', '/api/me'); render(); },

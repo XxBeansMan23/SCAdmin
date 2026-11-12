@@ -20,6 +20,8 @@ fs.mkdirSync(SAVES, { recursive: true });
 let db = { users: [], logs: [], saves: [] };
 if (fs.existsSync(DB_FILE)) db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
 db.crews ||= []; db.flags ||= [];
+db.settings ||= {};
+if (!db.settings.inviteCode) { db.settings.inviteCode = crypto.randomBytes(5).toString('hex'); persist(); }
 
 // Games / stat schema used by StatMaster (edit freely to add titles or fields)
 const f = (key, label, min, max, def) => ({ key, label, min, max, def });
@@ -195,8 +197,34 @@ async function api(req, res, url) {
     return send(res, 200, { ok: true }, { 'Set-Cookie': `sid=${t}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_MS / 1000}` });
   }
 
+  if (m === 'POST' && p === '/api/signup') {
+    if (!db.users.length) throw fail(403, 'Use the first-time setup');
+    if (tooManyFails(ip)) throw fail(429, 'Too many attempts. Wait a minute.');
+    const b = await readJson(req);
+    const code = Buffer.from(str(b.code, 64)), want = Buffer.from(db.settings.inviteCode);
+    if (code.length !== want.length || !crypto.timingSafeEqual(code, want)) { fails.get(ip).push(Date.now()); throw fail(403, 'Wrong invite code'); }
+    const nick = str(b.nickname, 24), email = str(b.email).toLowerCase(), pw = String(b.password || '');
+    if (nick.length < 3) throw fail(400, 'Nickname must be 3+ characters');
+    if (!validEmail(email)) throw fail(400, 'Invalid email');
+    if (pw.length < 8) throw fail(400, 'Password must be 8+ characters');
+    if (db.users.some(u => u.nickname.toLowerCase() === nick.toLowerCase())) throw fail(409, 'Nickname taken');
+    if (db.users.some(u => u.email === email)) throw fail(409, 'Email already used');
+    const u = makeUser({ nickname: nick, email, role: 'member', passHash: hashPw(pw) });
+    u.lastLogin = now(); u.lastIp = ip; u.loginCount = 1; u.loginHistory = [{ at: u.lastLogin, ip, ua: str(req.headers['user-agent'], 120) }];
+    db.users.push(u);
+    log(u.id, 'profile', 'Account created', 'Self sign-up with invite code', nick);
+    persist();
+    return send(res, 200, { ok: true }, { 'Set-Cookie': `sid=${newSession(u.id)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_MS / 1000}` });
+  }
+
   const me = authUser(req);
   if (!me) throw fail(401, 'Not signed in');
+
+  if (p === '/api/invite') {
+    if (!isAdmin(me)) throw fail(403, 'Admins only');
+    if (m === 'POST') { db.settings.inviteCode = crypto.randomBytes(5).toString('hex'); persist(); }
+    return send(res, 200, { code: db.settings.inviteCode });
+  }
 
   if (m === 'POST' && p === '/api/logout') {
     const t = parseCookies(req).sid; sessions.delete(t);

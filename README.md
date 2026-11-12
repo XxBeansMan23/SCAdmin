@@ -31,7 +31,7 @@ Uploads (chat files, clips, cloud saves) can go to **your Google Drive** instead
 3. **Credentials -> Create credentials -> OAuth client ID**, type **"TVs and Limited Input devices"**. Paste the client ID and secret into Owner tools.
 4. Click **Connect Google Drive**, open google.com/device, enter the code, pick your account, Allow.
 
-SCAdmin only gets the `drive.file` scope, so it can see only files it created itself (in a folder called *SCAdmin Files*), never the rest of your Drive. Uploads stream through the server (no size limit, constant memory) and downloads support Range requests, so videos still seek. Files already stored stay where they are; **Pause** or **Disconnect** sends new uploads back to local disk. If Drive is unreachable when an upload starts, it falls back to local disk.
+SCAdmin only gets the `drive.file` scope, so it can see only files it created itself (in a folder called *SCAdmin Files*), never the rest of your Drive. Every upload, any size, streams through the server to Drive as a chunked resumable upload (8 MiB chunks, each retried on network/5xx errors, no `Content-Length` needed, about one chunk of memory per upload); downloads support Range requests, so videos still seek. The card has **Test connection** (uploads, reads back and deletes a 4 KB file) and **Move them to Drive**, which moves everything still on the server's disk into Drive in the background. **Pause** or **Disconnect** sends new uploads back to local disk, and if Drive is unreachable at the moment of an upload, that one file is kept locally and can be moved later.
 
 ### Permissions (local Node server)
 

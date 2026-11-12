@@ -7,6 +7,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const zlib = require('zlib');
+const { Readable } = require('stream');
 
 const PORT = +process.env.PORT || 8080;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -167,12 +168,53 @@ const MEDIA = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'i
   mp4: 'video/mp4', m4v: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime', ogv: 'video/ogg' };
 /** Store an incoming upload. Goes to Google Drive when connected (falls back to local disk if Drive is unreachable before any bytes are read). */
 async function storeIncoming(req, dir, id, name) {
-  const len = parseInt(req.headers['content-length'], 10) || 0;
-  if (drive.active() && len > 0) {
-    try { return { size: len, store: 'drive', driveId: await drive.upload(req, name, len) }; }
+  if (drive.active()) {   // every attachment, any size; chunked upload so it does not matter how the request is framed
+    try { const out = await drive.upload(req, name, parseInt(req.headers['content-length'], 10) || 0); return { size: out.size, store: 'drive', driveId: out.id }; }
     catch (e) { if (!e.beforeBody) throw e; console.error('Drive unavailable, saving locally:', e.message); }
   }
   return { size: await saveStream(req, path.join(dir, id)) };
+}
+
+// Move files that are still on the server's disk into Drive (runs in the background; progress is shown in Owner tools).
+const migration = { running: false, total: 0, done: 0, failed: 0, error: '' };
+function localInventory() {
+  let files = 0, bytes = 0;
+  for (const x of db.messages) if (x.file && !x.file.store) { files++; bytes += x.file.size || 0; }
+  for (const s of db.saves) if (!s.store) { files++; bytes += s.size || 0; }
+  return { files, bytes };
+}
+function startMigration() {
+  if (migration.running) throw new Error('A move is already running');
+  if (!drive.active()) throw new Error('Connect Google Drive and turn it ON first');
+  const items = [];
+  for (const x of db.messages) if (x.file && !x.file.store) items.push({ rec: x.file, dir: FILES, alive: () => db.messages.includes(x) });
+  for (const s of db.saves) if (!s.store) items.push({ rec: s, dir: SAVES, alive: () => db.saves.includes(s) });
+  Object.assign(migration, { running: true, total: items.length, done: 0, failed: 0, error: '' });
+  (async () => {
+    for (const it of items) {
+      const p = path.join(it.dir, it.rec.id);
+      try {
+        if (!fs.existsSync(p)) { migration.failed++; continue; }
+        const out = await drive.upload(fs.createReadStream(p), it.rec.name, it.rec.size);
+        if (!it.alive()) { await drive.remove(out.id).catch(() => {}); continue; }   // deleted while it was uploading
+        it.rec.store = 'drive'; it.rec.driveId = out.id; it.rec.size = out.size;
+        persist();
+        try { fs.rmSync(p, { force: true }); } catch { /* still open by a download; harmless leftover */ }
+        migration.done++;
+      } catch (e) { migration.failed++; migration.error = e.message; }
+    }
+    migration.running = false;
+  })();
+}
+async function driveSelfTest() {   // upload 4 KB, read it back, compare, delete it
+  const data = crypto.randomBytes(4096), t0 = Date.now();
+  const out = await drive.upload(Readable.from([data]), 'scadmin-connection-test.bin', data.length);
+  try {
+    const res = await drive.open(out.id); const chunks = [];
+    for await (const c of res) chunks.push(c);
+    if (res.statusCode !== 200 || Buffer.compare(Buffer.concat(chunks), data) !== 0) throw new Error('What came back from Drive did not match what was uploaded');
+  } finally { await drive.remove(out.id).catch(() => {}); }
+  return { ok: true, ms: Date.now() - t0 };
 }
 function removeStored(rec, dir) {
   if (rec.store === 'drive') drive.remove(rec.driveId).catch(e => console.error('Drive delete failed:', e.message));
@@ -341,11 +383,15 @@ async function api(req, res, url) {
       return send(res, 200, { ok: true });
     }
     if (p.startsWith('/api/owner/drive')) {
-      if (m === 'GET' && p === '/api/owner/drive') return send(res, 200, await drive.status());
+      if (m === 'GET' && p === '/api/owner/drive') return send(res, 200, { ...(await drive.status()), local: localInventory(), migration: { ...migration } });
       if (m !== 'POST') throw fail(404, 'Unknown endpoint');
       const b = await readJson(req);
       try {
-        if (p === '/api/owner/drive/config') { drive.setCredentials(str(b.clientId, 300), str(b.clientSecret, 300)); log(me.id, 'security', 'Google Drive credentials saved', '', me.nickname); persist(); return send(res, 200, { ok: true }); }
+        if (p === '/api/owner/drive/migrate') { startMigration(); return send(res, 200, { ok: true, ...migration }); }
+        if (p === '/api/owner/drive/test') return send(res, 200, await driveSelfTest());
+        if (p === '/api/owner/drive/config') {
+          const cid = str(b.clientId, 300);
+          if (!process.env.DRIVE_OAUTH_BASE && !/^[\w.-]+\.apps\.googleusercontent\.com$/.test(cid)) throw new Error('That does not look like a Google client ID. It should end with ".apps.googleusercontent.com" (copy it from Credentials -> your OAuth client).'); drive.setCredentials(str(b.clientId, 300), str(b.clientSecret, 300)); log(me.id, 'security', 'Google Drive credentials saved', '', me.nickname); persist(); return send(res, 200, { ok: true }); }
         if (p === '/api/owner/drive/connect') return send(res, 200, await drive.startConnect());
         if (p === '/api/owner/drive/disconnect') { drive.disconnect(); log(me.id, 'security', 'Google Drive disconnected', 'new uploads go to local disk', me.nickname); persist(); return send(res, 200, { ok: true }); }
         if (p === '/api/owner/drive/enabled') { drive.setEnabled(!!b.enabled); log(me.id, 'security', b.enabled ? 'Google Drive storage turned on' : 'Google Drive storage turned off', '', me.nickname); persist(); return send(res, 200, { ok: true }); }

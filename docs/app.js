@@ -339,14 +339,17 @@ views.owner = async () => {
   const users = (await api('GET', '/api/users')).filter(u => u.role !== 'owner');
   const dr = await api('GET', '/api/owner/drive').catch(() => null);
   S.driveWaiting = !!(dr && dr.connect && dr.connect.state === 'waiting');
+  S.driveMigrating = !!(dr && dr.migration && dr.migration.running);
   const credForm = `<form data-form="driveSave"><label>Client ID</label><input name="clientId" required autocomplete="off" placeholder="1234567890-abc.apps.googleusercontent.com">
       <label>Client secret</label><input name="clientSecret" type="password" required autocomplete="off"><div style="margin-top:8px"><button class="btn pri">Save credentials</button></div></form>`;
   const quota = dr && dr.quota ? `${bytesFmt(+dr.quota.usage || 0)} used${+dr.quota.limit ? ' of ' + bytesFmt(+dr.quota.limit) : ' (no limit reported)'}` : '';
   const driveCard = !dr ? '' : `<div class="card"><h3>Google Drive storage ${dr.connected && dr.enabled ? '<span class="pill ok">ON</span>' : '<span class="pill">off</span>'}</h3><div class="bd">
-    ${!dr.configured ? `<p>Store uploaded clips and saves in <b>your Google Drive</b> instead of this server's disk. One-time setup:</p>
-      <ol style="margin:0 0 10px 18px;padding:0;line-height:1.7"><li>Open <b>console.cloud.google.com</b>, create a project, then <b>APIs &amp; Services → Library</b> and enable <b>Google Drive API</b>.</li>
-      <li><b>OAuth consent screen</b>: choose External, fill in an app name and your email, and set <b>Publishing status → In production</b> (the sign-in lapses after 7 days if you leave it in Testing).</li>
-      <li><b>Credentials → Create credentials → OAuth client ID</b>, application type <b>"TVs and Limited Input devices"</b>. Paste the client ID and secret below.</li></ol>${credForm}`
+    ${!dr.configured ? `<p>Send <b>every attachment</b> (any size) to <b>your Google Drive</b> instead of this server's disk. Google makes each app register once, so this is a free, one-time, 4-step setup that registers SCAdmin as <i>your own private app</i>. Use the buttons, they open the right Google pages:</p>
+      <ol style="margin:0 0 12px 18px;padding:0;line-height:2.1">
+        <li><a class="btn sm" href="https://console.cloud.google.com/projectcreate" target="_blank" rel="noopener">1. Create a project ↗</a> <span class="muted">any name, e.g. SCAdmin</span></li>
+        <li><a class="btn sm" href="https://console.cloud.google.com/apis/library/drive.googleapis.com" target="_blank" rel="noopener">2. Enable Google Drive API ↗</a> <span class="muted">click Enable</span></li>
+        <li><a class="btn sm" href="https://console.cloud.google.com/apis/credentials/consent" target="_blank" rel="noopener">3. Consent screen ↗</a> <span class="muted">External, app name + your email, then at the end <b>Publish app</b> (so it does not expire after 7 days)</span></li>
+        <li><a class="btn sm" href="https://console.cloud.google.com/apis/credentials/oauthclient" target="_blank" rel="noopener">4. Create OAuth client ↗</a> <span class="muted">type <b>"TVs and Limited Input devices"</b>, then copy the Client ID and secret into the boxes below</span></li></ol>${credForm}`
     : !dr.connected ? `<p>Credentials saved (${esc(dr.clientIdHint)}). Next, connect your Google account.</p>
       ${dr.connect && dr.connect.state === 'waiting' ? `<div style="padding:12px;border:2px dashed var(--accent);background:#fffaf0;margin:8px 0"><p style="margin:0 0 6px">1. Open <a href="${esc(dr.connect.verificationUrl)}" target="_blank" rel="noopener"><b>${esc(dr.connect.verificationUrl)}</b></a></p>
         <p style="margin:0 0 6px">2. Enter this code: <b style="font-size:24px;letter-spacing:3px">${esc(dr.connect.userCode)}</b></p><p class="muted" style="margin:0">3. Pick your Google account and click Allow. This page updates by itself.</p></div>`
@@ -355,9 +358,14 @@ views.owner = async () => {
       <details style="margin-top:10px"><summary class="muted" style="cursor:pointer">Change credentials</summary>${credForm}</details>`
     : `<p>Connected${dr.account ? ' as <b>' + esc(dr.account) + '</b>' : ''}. New uploads go to the <b>${esc(dr.folder || 'SCAdmin Files')}</b> folder in your Drive. ${quota ? '<br><span class="muted">' + quota + '</span>' : ''}</p>
       ${dr.error ? `<div class="err">${esc(dr.error)}</div>` : ''}
-      <div class="row"><button class="btn ${dr.enabled ? '' : 'pri'}" data-act="driveEnabled" data-on="${dr.enabled ? 0 : 1}">${dr.enabled ? 'Pause (new uploads go to this server)' : 'Turn Drive storage on'}</button>
+      ${dr.migration && dr.migration.running ? `<div class="banner" style="background:#fff4d6;border-color:#ecd49a;color:#6b4f00">⏳ Moving files to Drive… <b>${dr.migration.done + dr.migration.failed} / ${dr.migration.total}</b>${dr.migration.failed ? ` (${dr.migration.failed} failed)` : ''}. You can leave this page; it keeps going.</div>`
+        : dr.local && dr.local.files ? `<div class="banner" style="background:#fff4d6;border-color:#ecd49a;color:#6b4f00"><b>${dr.local.files}</b> file${dr.local.files === 1 ? ' is' : 's are'} still on this server's disk (${bytesFmt(dr.local.bytes)}). <button class="btn sm pri" data-act="driveMigrate" ${dr.enabled ? '' : 'disabled title="Turn Drive storage on first"'}>Move them to Drive</button>
+          ${dr.migration && dr.migration.done ? `<br><span class="muted">Last move: ${dr.migration.done} moved${dr.migration.failed ? ', ' + dr.migration.failed + ' failed' : ''}${dr.migration.error ? ' (' + esc(dr.migration.error) + ')' : ''}.</span>` : ''}</div>`
+        : `<p class="muted" style="margin:0 0 8px">✓ Nothing is stored on this server's disk. All attachments are in Drive.${dr.migration && dr.migration.done ? ` (${dr.migration.done} moved just now)` : ''}</p>`}
+      <div class="row"><button class="btn" data-act="driveTest">Test connection</button>
+        <button class="btn ${dr.enabled ? '' : 'pri'}" data-act="driveEnabled" data-on="${dr.enabled ? 0 : 1}">${dr.enabled ? 'Pause (new uploads go to this server)' : 'Turn Drive storage on'}</button>
         <button class="btn bad" data-act="driveDisconnect">Disconnect</button></div>
-      <p class="muted" style="margin:10px 0 0">Files already uploaded stay where they are (server or Drive) and keep working. SCAdmin can only see files it created, never the rest of your Drive.</p>`}
+      <p class="muted" style="margin:10px 0 0">Uploads of any size stream straight through to Drive in small pieces, so big files and slow connections are fine. If Drive is unreachable at the moment someone uploads, that one file is kept on the server instead of failing, and the Move button above brings it over later. SCAdmin can only see files it created, never the rest of your Drive.</p>`}
     </div></div>`;
   return `<h2 class="page-title">★ Owner tools <span class="pill acc">elevated</span></h2>
   <p class="muted">Only the owner account (${esc(S.me.nickname)}) sees this menu. Admins cannot open it.</p>
@@ -384,7 +392,7 @@ views.owner = async () => {
 views.mine = () => { S.view = 'user'; S.uid = S.me.id; return views.user(); };
 const afterRender = {
   chat: chatAfter,
-  owner() { if (S.driveWaiting) setTimeout(() => { if (S.view === 'owner') render(); }, 4000); },   // poll while the Google sign-in is pending
+  owner() { if (S.driveWaiting || S.driveMigrating) setTimeout(() => { if (S.view === 'owner') render(); }, S.driveMigrating ? 2500 : 4000); },   // poll while sign-in or a move is in progress
   members() { const q = $('#mq'); q.addEventListener('input', () => { clearTimeout(searchT); searchT = setTimeout(async () => { S.mq = q.value; const pos = q.selectionStart; await render(); const n = $('#mq'); n.focus(); n.setSelectionRange(pos, pos); }, 300); }); },
   audit() { const q = $('#auditQ'); q.addEventListener('input', () => { clearTimeout(searchT); searchT = setTimeout(async () => { S.auditQ = q.value; const pos = q.selectionStart; await render(); const n = $('#auditQ'); n.focus(); n.setSelectionRange(pos, pos); }, 300); }); },
 };
@@ -521,6 +529,13 @@ const acts = {
     if (!confirm(`Permanently delete ${el.dataset.name}, their saves, DMs and logs? This cannot be undone.`)) return;
     await api('DELETE', '/api/users/' + el.dataset.id); toast('Account deleted'); render();
   },
+  async driveTest(el) {
+    el.disabled = true; el.textContent = 'Testing…';
+    try { const r = await api('POST', '/api/owner/drive/test', {}); toast(`✓ Drive works: uploaded, read back and deleted a test file in ${r.ms} ms`); }
+    catch (e) { toast('Drive test failed: ' + e.message, true); }
+    render();
+  },
+  async driveMigrate() { await api('POST', '/api/owner/drive/migrate', {}); toast('Moving files to Drive…'); render(); },
   async driveConnect() { await api('POST', '/api/owner/drive/connect', {}); render(); },
   async driveDisconnect() { if (!confirm('Disconnect Google Drive? New uploads will go to this server. Files already in Drive keep working only while connected.')) return; await api('POST', '/api/owner/drive/disconnect', {}); toast('Disconnected'); render(); },
   async driveEnabled(el) { await api('POST', '/api/owner/drive/enabled', { enabled: el.dataset.on === '1' }); toast(el.dataset.on === '1' ? 'Drive storage on' : 'Drive storage paused'); render(); },

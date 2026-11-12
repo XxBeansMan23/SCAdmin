@@ -1,0 +1,8 @@
+{
+  "name": "SCAdmin",
+  "image": "mcr.microsoft.com/devcontainers/javascript-node:1-22-bookworm",
+  "forwardPorts": [8080],
+  "portsAttributes": { "8080": { "label": "SCAdmin", "onAutoForward": "notify" } },
+  "containerEnv": { "PORT": "8080", "HOST": "0.0.0.0" },
+  "postStartCommand": "nohup node server.js > /tmp/scadmin.log 2>&1 &"
+}

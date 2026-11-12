@@ -1,0 +1,5 @@
+# Runtime data: members, password hashes, chat, uploaded saves/files. NEVER commit this.
+data/
+*.log
+node_modules/
+.env

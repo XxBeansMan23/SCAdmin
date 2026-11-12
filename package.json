@@ -1,0 +1,9 @@
+{
+  "name": "scadmin",
+  "version": "1.0.0",
+  "description": "Private member admin + team chat panel for a small group of devs, testers and friends. Zero dependencies.",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=20" },
+  "private": true
+}
